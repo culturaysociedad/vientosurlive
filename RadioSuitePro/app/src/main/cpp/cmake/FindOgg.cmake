@@ -1,0 +1,6 @@
+if(TARGET Ogg::ogg)
+    set(Ogg_FOUND TRUE)
+    set(OGG_FOUND TRUE)
+else()
+    find_package(Ogg CONFIG REQUIRED)
+endif()
