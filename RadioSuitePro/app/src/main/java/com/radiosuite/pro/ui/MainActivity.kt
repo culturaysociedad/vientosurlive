@@ -6,11 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -21,6 +24,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -55,7 +59,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -67,23 +71,45 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Radio
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -93,13 +119,20 @@ import com.radiosuite.pro.dsp.DspParameters
 import com.radiosuite.pro.model.BroadcastProfile
 import com.radiosuite.pro.model.CodecType
 import com.radiosuite.pro.service.PlaybackSnapshot
+import com.radiosuite.pro.service.FavoriteTrack
 import com.radiosuite.pro.service.MixLevels
 import com.radiosuite.pro.service.RadioEngineService
 import com.radiosuite.pro.service.SavedPlaylistSummary
 import com.radiosuite.pro.service.StreamSnapshot
+import com.radiosuite.pro.service.SwiperSnapshot
 import com.radiosuite.pro.stream.BroadcastProfileStore
 import com.radiosuite.pro.ui.theme.RadioSuiteProTheme
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
 
 private data class MeterSnapshot(
     val inputDb: Float = -120f,
@@ -191,17 +224,75 @@ private fun RadioSuiteConsole(
     darkTheme: Boolean,
     onToggleTheme: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val profileStore = remember(context) { BroadcastProfileStore(context) }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var playerExpanded by rememberSaveable { mutableStateOf(false) }
     var playback by remember(service) { mutableStateOf(PlaybackSnapshot()) }
     var stream by remember(service) { mutableStateOf(StreamSnapshot()) }
     var mixLevels by remember(service) { mutableStateOf(MixLevels()) }
     var playlists by remember(service) { mutableStateOf(emptyList<SavedPlaylistSummary>()) }
+    var favorites by remember(service) { mutableStateOf(emptyList<FavoriteTrack>()) }
+    var swiperStatus by remember(service) { mutableStateOf(SwiperSnapshot()) }
+    var pendingStudioProfile by remember { mutableStateOf<BroadcastProfile?>(null) }
+    var studioActionMessage by remember { mutableStateOf("") }
+
+    fun startProfileBroadcast(profile: BroadcastProfile) {
+        startBroadcast(
+            context,
+            BroadcastConfig(profile.name, profile.host, profile.port, profile.mount, profile.password, profile.bitrate),
+        )
+        studioActionMessage = ""
+    }
+
+    val studioPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        val profile = pendingStudioProfile
+        pendingStudioProfile = null
+        if (profile != null && (
+                results[Manifest.permission.RECORD_AUDIO] == true ||
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                )
+        ) {
+            startProfileBroadcast(profile)
+        } else if (profile != null) {
+            studioActionMessage = "Permite el micrófono para iniciar la emisión."
+        }
+    }
+
+    val onToggleStudioBroadcast = {
+        if (stream.isStreaming) {
+            service?.stopStreaming()
+            studioActionMessage = ""
+        } else {
+            val profiles = profileStore.loadProfiles()
+            val lastProfileName = profileStore.lastUsedProfileName()
+            val profile = profiles.firstOrNull { it.name == lastProfileName } ?: profiles.firstOrNull()
+            if (profile == null) {
+                studioActionMessage = "Configura y guarda un perfil de Icecast en Emisión."
+                selectedTab = 2
+            } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startProfileBroadcast(profile)
+            } else {
+                pendingStudioProfile = profile
+                val requestedPermissions = buildList {
+                    add(Manifest.permission.RECORD_AUDIO)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        add(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+                studioPermissionLauncher.launch(requestedPermissions.toTypedArray())
+            }
+        }
+    }
 
     LaunchedEffect(service) { service?.playback?.collectLatest { playback = it } }
     LaunchedEffect(service) { service?.streamStatus?.collectLatest { stream = it } }
     LaunchedEffect(service) { service?.mixLevels?.collectLatest { mixLevels = it } }
     LaunchedEffect(service) { service?.savedPlaylists?.collectLatest { playlists = it } }
+    LaunchedEffect(service) { service?.favoriteTracks?.collectLatest { favorites = it } }
+    LaunchedEffect(service) { service?.swiperStatus?.collectLatest { swiperStatus = it } }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -213,12 +304,24 @@ private fun RadioSuiteConsole(
                     onTogglePlayback = { service?.togglePlayback() },
                     onNext = { service?.skipToNext() },
                 )
-                NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 4.dp,
+                ) {
                     listOf("Estudio", "DSP", "Emisión").forEachIndexed { index, label ->
                         NavigationBarItem(
                             selected = selectedTab == index,
                             onClick = { selectedTab = index },
-                            icon = { Text("0${index + 1}", fontFamily = FontFamily.Monospace) },
+                            icon = {
+                                Icon(
+                                    imageVector = when (index) {
+                                        0 -> Icons.Filled.GraphicEq
+                                        1 -> Icons.Filled.Tune
+                                        else -> Icons.Filled.Radio
+                                    },
+                                    contentDescription = null,
+                                )
+                            },
                             label = { Text(label) },
                         )
                     }
@@ -232,7 +335,7 @@ private fun RadioSuiteConsole(
             ConsoleHeader(service != null, stream, darkTheme, onToggleTheme)
             Spacer(Modifier.height(20.dp))
             when (selectedTab) {
-                0 -> StudioScreen(service, meters, stream, mixLevels)
+                0 -> StudioScreen(service, meters, stream, mixLevels, onToggleStudioBroadcast, studioActionMessage)
                 1 -> DspScreen(service)
                 else -> BroadcastScreen(stream)
             }
@@ -249,6 +352,9 @@ private fun RadioSuiteConsole(
                 service = service,
                 playback = playback,
                 playlists = playlists,
+                favorites = favorites,
+                swiperStatus = swiperStatus,
+                onClose = { playerExpanded = false },
             )
         }
     }
@@ -256,6 +362,7 @@ private fun RadioSuiteConsole(
 
 @Composable
 private fun ConsoleHeader(ready: Boolean, stream: StreamSnapshot, darkTheme: Boolean, onToggleTheme: () -> Unit) {
+    val statusLabel = if (stream.isConnected) "AL AIRE" else if (stream.isStreaming) "CONECTANDO" else if (ready) "MOTOR LISTO" else "INICIANDO"
     Row(
         Modifier.fillMaxWidth().padding(top = 22.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -266,15 +373,36 @@ private fun ConsoleHeader(ready: Boolean, stream: StreamSnapshot, darkTheme: Boo
             Text("En directo", style = MaterialTheme.typography.headlineSmall)
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(Modifier.size(8.dp), shape = CircleShape, color = if (stream.isConnected) LiveGreen else MaterialTheme.colorScheme.primary) {}
-            Spacer(Modifier.width(8.dp))
-            Text(if (stream.isConnected) "AL AIRE" else if (stream.isStreaming) "CONECTANDO" else if (ready) "MOTOR LISTO" else "INICIANDO", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            FilledTonalButton(
-                onClick = onToggleTheme,
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
                 shape = CircleShape,
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 7.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
             ) {
-                Text(if (darkTheme) "☼  CLARO" else "◐  OSCURO", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Row(
+                    Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Surface(
+                        Modifier.size(7.dp),
+                        shape = CircleShape,
+                        color = if (stream.isConnected) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
+                    ) {}
+                    Spacer(Modifier.width(7.dp))
+                    Text(
+                        statusLabel,
+                        color = if (stream.isConnected) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.5.sp,
+                    )
+                }
+            }
+            IconButton(onClick = onToggleTheme) {
+                Icon(
+                    imageVector = if (darkTheme) Icons.Filled.LightMode else Icons.Filled.DarkMode,
+                    contentDescription = if (darkTheme) "Cambiar a modo claro" else "Cambiar a modo oscuro",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
             }
         }
     }
@@ -289,6 +417,8 @@ private fun MiniPlayerBar(
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
@@ -296,7 +426,7 @@ private fun MiniPlayerBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Row(Modifier.weight(1f).clickable(onClick = onExpand), verticalAlignment = Alignment.CenterVertically) {
-                RadioArtwork(Modifier.size(42.dp))
+                TrackArtwork(Modifier.size(42.dp), playback.artworkData)
                 Spacer(Modifier.width(12.dp))
                 Column {
                     Text(playback.title, maxLines = 1, style = MaterialTheme.typography.titleSmall)
@@ -323,174 +453,495 @@ private fun ExpandedPlayer(
     service: RadioEngineService?,
     playback: PlaybackSnapshot,
     playlists: List<SavedPlaylistSummary>,
+    favorites: List<FavoriteTrack>,
+    swiperStatus: SwiperSnapshot,
+    onClose: () -> Unit,
 ) {
-    var showingPlaylists by rememberSaveable { mutableStateOf(false) }
-    var newPlaylistName by rememberSaveable { mutableStateOf("") }
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var selectedView by rememberSaveable { mutableIntStateOf(0) }
+    var selectedPlaylistName by rememberSaveable { mutableStateOf("") }
+    var playlistNameDraft by rememberSaveable { mutableStateOf("") }
+    var playlistSearch by rememberSaveable { mutableStateOf("") }
+    var renamePlaylistDraft by rememberSaveable { mutableStateOf("") }
+    var isRenamingPlaylist by rememberSaveable { mutableStateOf(false) }
+    var isConfirmingPlaylistDelete by rememberSaveable { mutableStateOf(false) }
+    var isAddingQueueTracks by rememberSaveable { mutableStateOf(false) }
     var addMessage by rememberSaveable { mutableStateOf("") }
     var seekPosition by remember(playback.currentIndex) { mutableFloatStateOf(playback.positionMs.toFloat()) }
+    var isSeeking by remember { mutableStateOf(false) }
     var contextMenuIndex by remember { mutableIntStateOf(-1) }
+    var playlistTrackMenuIndex by remember { mutableIntStateOf(-1) }
     var playlistPickerIndex by remember { mutableIntStateOf(-1) }
+    var favoriteToAdd by remember { mutableStateOf<FavoriteTrack?>(null) }
+    var speedMenuExpanded by remember { mutableStateOf(false) }
+    var playerMenuExpanded by remember { mutableStateOf(false) }
+    var queueSearch by rememberSaveable { mutableStateOf("") }
+    val selectedPlaylist = playlists.firstOrNull { it.name == selectedPlaylistName }
+
+    val swiperFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri != null) {
+            coroutineScope.launch {
+                addMessage = "Leyendo carpeta para Swiper…"
+                try {
+                    val folder = withContext(Dispatchers.IO) {
+                        context.contentResolver.takePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                        displayName(context, treeUri) to collectAudioTracks(context, treeUri)
+                    }
+                    val configured = service?.configureSwiperFolder(treeUri, folder.first, folder.second) == true
+                    addMessage = if (configured) {
+                        "Swiper activo: ${folder.first}. Insertará un identificativo cada dos temas."
+                    } else {
+                        "La carpeta seleccionada no contiene audio compatible."
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudo configurar la carpeta Swiper", error)
+                    addMessage = "No se pudo leer la carpeta para Swiper."
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(playback.positionMs, playback.currentIndex) {
+        if (!isSeeking) seekPosition = playback.positionMs.toFloat()
+    }
 
     Column(
-        Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        Modifier.fillMaxWidth().fillMaxHeight().padding(horizontal = 20.dp),
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Column {
-                Text("REPRODUCIENDO", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp)
-                Text("Tu sesión", style = MaterialTheme.typography.titleLarge)
+                Text("RADIO SUITE", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("Reproductor", style = MaterialTheme.typography.titleLarge)
             }
-            Text("${playback.queueSize} EN COLA", color = MutedText, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-        }
-        RadioArtwork(Modifier.fillMaxWidth().aspectRatio(1f))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(playback.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, maxLines = 2)
-                Spacer(Modifier.height(3.dp))
-                Text("BIBLIOTECA LOCAL · RADIOSUITE", color = MutedText, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.6.sp)
+            Box {
+                IconButton(onClick = { playerMenuExpanded = true }) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = "Opciones del reproductor")
+                }
+                DropdownMenu(
+                    expanded = playerMenuExpanded,
+                    onDismissRequest = { playerMenuExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Añadir a la cola") },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.QueueMusic, contentDescription = null) },
+                        onClick = {
+                            selectedView = 1
+                            playerMenuExpanded = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Añadir lista") },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = null) },
+                        onClick = {
+                            selectedView = 2
+                            selectedPlaylistName = ""
+                            playerMenuExpanded = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(if (swiperStatus.isConfigured) "Cambiar Swiper" else "Añadir Swiper") },
+                        leadingIcon = { Icon(Icons.Filled.Radio, contentDescription = null) },
+                        onClick = {
+                            playerMenuExpanded = false
+                            swiperFolderPicker.launch(null)
+                        },
+                    )
+                    if (swiperStatus.isConfigured) {
+                        DropdownMenuItem(
+                            text = { Text("Swiper · ${swiperStatus.folderName} (${swiperStatus.trackCount})", maxLines = 1) },
+                            enabled = false,
+                            onClick = {},
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Desactivar Swiper") },
+                            onClick = {
+                                service?.clearSwiperFolder()
+                                service?.removeSwiperItemsFromQueue()
+                                playerMenuExpanded = false
+                                addMessage = "Swiper desactivado."
+                            },
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text("Cerrar reproductor") },
+                        onClick = {
+                            playerMenuExpanded = false
+                            onClose()
+                        },
+                    )
+                }
             }
-            Text("●", color = MaterialTheme.colorScheme.primary, fontSize = 22.sp)
         }
 
-        Column {
-            Slider(
-                value = seekPosition.coerceIn(0f, playback.durationMs.coerceAtLeast(1L).toFloat()),
-                onValueChange = { seekPosition = it },
-                valueRange = 0f..playback.durationMs.coerceAtLeast(1L).toFloat(),
-                onValueChangeFinished = { service?.seekTo(seekPosition.toLong()) },
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(timeLabel(playback.positionMs), color = MutedText, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-                Text(timeLabel(playback.durationMs), color = MutedText, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        ScrollableTabRow(selectedTabIndex = if (selectedView == 3) 1 else 0, edgePadding = 0.dp) {
+            listOf("Ahora" to 0, "Favoritos · ${favorites.size}" to 3).forEach { (label, targetView) ->
+                Tab(
+                    selected = selectedView == targetView,
+                    onClick = { selectedView = targetView },
+                    text = { Text(label, maxLines = 1) },
+                    icon = {
+                        Icon(
+                            imageVector = when (targetView) {
+                                0 -> Icons.Filled.PlayCircle
+                                else -> Icons.Filled.Favorite
+                            },
+                            contentDescription = null,
+                        )
+                    },
+                )
             }
         }
 
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { service?.toggleShuffle() }) {
-                Text(if (playback.shuffleEnabled) "⤨ ACTIVO" else "⤨", color = if (playback.shuffleEnabled) MaterialTheme.colorScheme.primary else MutedText)
-            }
-            TextButton(onClick = { service?.skipToPrevious() }, enabled = playback.queueSize > 0) {
-                Text("|◀", fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)
-            }
-            Surface(
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(64.dp).clickable(enabled = playback.queueSize > 0) { service?.togglePlayback() },
+        when (selectedView) {
+            0 -> Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 16.dp, bottom = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(if (playback.isPlaying) "Ⅱ" else "▶", color = MaterialTheme.colorScheme.onPrimary, fontSize = 25.sp, fontWeight = FontWeight.Bold)
+                TrackArtwork(
+                    Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 12.dp),
+                    playback.artworkData,
+                )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(playback.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, maxLines = 2)
+                        val subtitle = listOf(playback.artist, playback.album).filter(String::isNotBlank).joinToString(" · ")
+                        Text(
+                            subtitle.ifBlank { "ARCHIVO LOCAL · RADIOSUITE" },
+                            color = MutedText,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                        )
+                    }
+                    Text("${playback.currentIndex + 1}/${playback.queueSize}", color = MutedText, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    TextButton(onClick = { service?.toggleFavoriteCurrentTrack() }, enabled = playback.queueSize > 0) {
+                        Text(if (playback.isFavorite) "♥" else "♡", color = if (playback.isFavorite) MaterialTheme.colorScheme.primary else MutedText, fontSize = 22.sp)
+                    }
                 }
-            }
-            TextButton(onClick = { service?.skipToNext() }, enabled = playback.queueSize > 0) {
-                Text("▶|", fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)
-            }
-            TextButton(onClick = { service?.cycleRepeatMode() }) {
-                val repeatLabel = when (playback.repeatMode) {
-                    androidx.media3.common.Player.REPEAT_MODE_ALL -> "↻ ALL"
-                    androidx.media3.common.Player.REPEAT_MODE_ONE -> "↻ 1"
-                    else -> "↻"
-                }
-                Text(repeatLabel, color = if (playback.repeatMode == androidx.media3.common.Player.REPEAT_MODE_OFF) MutedText else MaterialTheme.colorScheme.primary)
-            }
-        }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            FilterChip(selected = !showingPlaylists, onClick = { showingPlaylists = false }, label = { Text("COLA · ${playback.queueSize}") })
-            FilterChip(selected = showingPlaylists, onClick = { showingPlaylists = true }, label = { Text("PLAYLISTS") })
-            Spacer(Modifier.weight(1f))
-            AddTracksButton(service, Modifier) { count ->
-                addMessage = when {
-                    count > 0 -> "Se añadieron $count pistas a la cola."
-                    count == 0 -> "No se añadieron pistas. Comprueba el servicio y el formato del archivo."
-                    else -> "El reproductor no está listo; vuelve a intentarlo."
+                Column {
+                    Slider(
+                        value = seekPosition.coerceIn(0f, playback.durationMs.coerceAtLeast(1L).toFloat()),
+                        onValueChange = {
+                            isSeeking = true
+                            seekPosition = it
+                        },
+                        valueRange = 0f..playback.durationMs.coerceAtLeast(1L).toFloat(),
+                        onValueChangeFinished = {
+                            service?.seekTo(seekPosition.toLong())
+                            isSeeking = false
+                        },
+                        enabled = playback.durationMs > 0L,
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(timeLabel(if (isSeeking) seekPosition.toLong() else playback.positionMs), color = MutedText, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                        Text(timeLabel(playback.durationMs), color = MutedText, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                    }
+                }
+
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { service?.toggleShuffle() }) {
+                        Text("⤨", color = if (playback.shuffleEnabled) MaterialTheme.colorScheme.primary else MutedText)
+                    }
+                    TextButton(onClick = { service?.skipToPrevious() }, enabled = playback.queueSize > 0) {
+                        Text("|◀", fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)
+                    }
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(64.dp).clickable(enabled = playback.queueSize > 0) { service?.togglePlayback() },
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(if (playback.isPlaying) "Ⅱ" else "▶", color = MaterialTheme.colorScheme.onPrimary, fontSize = 25.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    TextButton(onClick = { service?.skipToNext() }, enabled = playback.queueSize > 0) {
+                        Text("▶|", fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)
+                    }
+                    TextButton(onClick = { service?.cycleRepeatMode() }) {
+                        val repeatLabel = when (playback.repeatMode) {
+                            androidx.media3.common.Player.REPEAT_MODE_ALL -> "↻"
+                            androidx.media3.common.Player.REPEAT_MODE_ONE -> "↻1"
+                            else -> "↻"
+                        }
+                        Text(repeatLabel, color = if (playback.repeatMode == androidx.media3.common.Player.REPEAT_MODE_OFF) MutedText else MaterialTheme.colorScheme.primary)
+                    }
+                }
+
+                Box {
+                    TextButton(onClick = { speedMenuExpanded = true }) {
+                        Text("VELOCIDAD  ${playback.playbackSpeed}×", color = MaterialTheme.colorScheme.primary)
+                    }
+                    DropdownMenu(expanded = speedMenuExpanded, onDismissRequest = { speedMenuExpanded = false }) {
+                        listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f).forEach { speed ->
+                            DropdownMenuItem(
+                                text = { Text("${speed}×") },
+                                onClick = {
+                                    service?.setPlaybackSpeed(speed)
+                                    speedMenuExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(
+                        onClick = { selectedView = 1 },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.QueueMusic, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("COLA · ${playback.queueSize}", maxLines = 1)
+                    }
+                    OutlinedButton(
+                        onClick = { selectedView = 2 },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("PLAYLISTS · ${playlists.size}", maxLines = 1)
+                    }
                 }
             }
-        }
-        if (addMessage.isNotBlank()) Text(addMessage, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
 
-        if (showingPlaylists) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            1 -> Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 12.dp, bottom = 16.dp),
+            ) {
+                val visibleQueue = playback.queue.mapIndexedNotNull { index, title ->
+                    if (queueSearch.isBlank() || title.contains(queueSearch.trim(), ignoreCase = true)) index to title else null
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { selectedView = 0 }) { Text("‹ AHORA") }
+                        Text("A continuación", style = MaterialTheme.typography.titleMedium)
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        AddTracksButton(service, Modifier) { result ->
+                            addMessage = when {
+                                result.error != null -> result.error
+                                result.folderAdded -> "Se añadió la carpeta ${result.folderName}; elegirá una pista al azar entre ${result.folderTrackCount}."
+                                result.trackCount > 0 -> "Se añadieron ${result.trackCount} pistas a la cola."
+                                result.source == AudioImportSource.FOLDER -> "La carpeta no contiene pistas de audio compatibles."
+                                result.trackCount == 0 -> "No se añadieron pistas. Comprueba el formato del archivo."
+                                else -> "El reproductor no está listo; vuelve a intentarlo."
+                            }
+                        }
+                        TextButton(onClick = { service?.clearQueue() }, enabled = playback.queueSize > 0) { Text("VACIAR") }
+                    }
+                }
                 OutlinedTextField(
-                    value = newPlaylistName,
-                    onValueChange = { newPlaylistName = it },
-                    modifier = Modifier.weight(1f),
-                    label = { Text("Nombre de la lista") },
+                    value = queueSearch,
+                    onValueChange = { queueSearch = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp),
+                    label = { Text("Buscar pista en la cola") },
+                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
                     singleLine = true,
                 )
-                Button(
-                    onClick = {
-                        if (service?.createPlaylist(newPlaylistName) == true) newPlaylistName = ""
-                    },
-                    enabled = playback.queueSize > 0 && newPlaylistName.isNotBlank(),
-                ) { Text("GUARDAR") }
+                if (addMessage.isNotBlank()) Text(addMessage, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                if (playback.queue.isEmpty()) {
+                    Text("Añade archivos de audio para empezar.", modifier = Modifier.padding(top = 20.dp), color = MutedText)
+                } else if (visibleQueue.isEmpty()) {
+                    Text("No hay pistas que coincidan con la búsqueda.", modifier = Modifier.padding(top = 20.dp), color = MutedText)
+                } else {
+                    if (queueSearch.isNotBlank()) {
+                        Text("${visibleQueue.size} resultados", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                    }
+                    visibleQueue.forEach { (index, title) ->
+                        Box(Modifier.fillMaxWidth()) {
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .combinedClickable(
+                                        onClick = { service?.playQueueItem(index) },
+                                        onLongClick = { contextMenuIndex = index },
+                                    )
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("%02d".format(index + 1), modifier = Modifier.width(38.dp), color = if (index == playback.currentIndex) MaterialTheme.colorScheme.primary else MutedText, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                                Column(Modifier.weight(1f)) {
+                                    Text(title, maxLines = 1, fontWeight = if (index == playback.currentIndex) FontWeight.Bold else FontWeight.Normal)
+                                    if (index == playback.currentIndex) Text("REPRODUCIENDO", color = MaterialTheme.colorScheme.primary, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Text("⋮", color = MutedText, fontSize = 20.sp)
+                            }
+                            DropdownMenu(expanded = contextMenuIndex == index, onDismissRequest = { contextMenuIndex = -1 }) {
+                                DropdownMenuItem(text = { Text("Subir en la cola") }, enabled = index > 0, onClick = {
+                                    service?.moveQueueItem(index, index - 1)
+                                    contextMenuIndex = -1
+                                })
+                                DropdownMenuItem(text = { Text("Bajar en la cola") }, enabled = index < playback.queue.lastIndex, onClick = {
+                                    service?.moveQueueItem(index, index + 1)
+                                    contextMenuIndex = -1
+                                })
+                                DropdownMenuItem(text = { Text("Reproducir a continuación") }, onClick = {
+                                    service?.playQueueItemNext(index)
+                                    contextMenuIndex = -1
+                                })
+                                DropdownMenuItem(text = { Text("Añadir a playlist") }, enabled = playlists.isNotEmpty(), onClick = {
+                                    playlistPickerIndex = index
+                                    contextMenuIndex = -1
+                                })
+                                DropdownMenuItem(text = { Text("Eliminar de la cola", color = MaterialTheme.colorScheme.error) }, onClick = {
+                                    service?.removeQueueItem(index)
+                                    contextMenuIndex = -1
+                                })
+                            }
+                        }
+                    }
+                }
             }
-            if (playlists.isEmpty()) {
-                Text("Crea una playlist desde la cola actual.", color = MutedText, style = MaterialTheme.typography.bodySmall)
-            } else {
-                playlists.forEach { playlist ->
-                    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
-                        Column(Modifier.fillMaxWidth().padding(14.dp)) {
-                            Text(playlist.name, fontWeight = FontWeight.SemiBold)
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Text("${playlist.trackCount} pistas", color = MutedText, style = MaterialTheme.typography.bodySmall)
-                                Row {
-                                    TextButton(onClick = { service?.appendPlaylist(playlist.name) }) { Text("AÑADIR") }
-                                    TextButton(onClick = { service?.loadPlaylist(playlist.name) }) { Text("CARGAR") }
+
+            2 -> Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 12.dp, bottom = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (selectedPlaylist != null) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { selectedPlaylistName = "" }) { Text("‹ LISTAS") }
+                        Column(Modifier.weight(1f)) {
+                            Text(selectedPlaylist.name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                            Text("${selectedPlaylist.trackCount} elementos", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                        }
+                        TextButton(onClick = { isRenamingPlaylist = true; renamePlaylistDraft = selectedPlaylist.name }) { Text("RENOMBRAR") }
+                        TextButton(onClick = { isConfirmingPlaylistDelete = true }) { Text("ELIMINAR", color = MaterialTheme.colorScheme.error) }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AddTracksToPlaylistButton(selectedPlaylist.name, service, Modifier.weight(1f)) { result ->
+                                addMessage = when {
+                                    result.error != null -> result.error
+                                    result.folderAdded -> "Se añadió la carpeta ${result.folderName} como una entrada aleatoria."
+                                    result.trackCount > 0 -> "Se añadieron ${result.trackCount} pistas a la playlist."
+                                    result.source == AudioImportSource.FOLDER -> "La carpeta no contiene pistas de audio compatibles."
+                                    else -> "No se añadieron pistas."
+                                }
+                            }
+                            OutlinedButton(onClick = { isAddingQueueTracks = true }, enabled = playback.queueSize > 0, modifier = Modifier.weight(1f)) { Text("DESDE COLA") }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            TextButton(onClick = { service?.appendPlaylist(selectedPlaylist.name) }) { Text("AÑADIR A COLA") }
+                            TextButton(onClick = { service?.loadPlaylist(selectedPlaylist.name) }, enabled = selectedPlaylist.trackCount > 0) { Text("REPRODUCIR") }
+                            TextButton(onClick = { service?.playPlaylistRandom(selectedPlaylist.name) }, enabled = selectedPlaylist.trackCount > 0) { Text("ALEATORIA") }
+                        }
+                    }
+                    if (addMessage.isNotBlank()) Text(addMessage, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                    if (selectedPlaylist.tracks.isEmpty()) {
+                        Text("Esta playlist está vacía.", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        selectedPlaylist.tracks.forEachIndexed { index, track ->
+                            Box(Modifier.fillMaxWidth()) {
+                                Row(
+                                    Modifier.fillMaxWidth().clickable { service?.playPlaylistTrack(selectedPlaylist.name, index) }.padding(vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text("%02d".format(index + 1), modifier = Modifier.width(38.dp), color = MutedText, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                                        Text(
+                                            if (track.isFolder) "Carpeta · ${track.title} (${track.folderTrackCount} pistas)" else track.title,
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                        )
+                                    IconButton(onClick = { playlistTrackMenuIndex = index }) { Text("⋮", color = MutedText, fontSize = 20.sp) }
+                                }
+                                DropdownMenu(
+                                    expanded = playlistTrackMenuIndex == index,
+                                    onDismissRequest = { playlistTrackMenuIndex = -1 },
+                                ) {
+                                    DropdownMenuItem(text = { Text("Subir en la playlist") }, enabled = index > 0, onClick = {
+                                        service?.moveTrackInPlaylist(selectedPlaylist.name, index, index - 1)
+                                        playlistTrackMenuIndex = -1
+                                    })
+                                    DropdownMenuItem(text = { Text("Bajar en la playlist") }, enabled = index < selectedPlaylist.tracks.lastIndex, onClick = {
+                                        service?.moveTrackInPlaylist(selectedPlaylist.name, index, index + 1)
+                                        playlistTrackMenuIndex = -1
+                                    })
+                                    DropdownMenuItem(text = { Text("Quitar de la playlist", color = MaterialTheme.colorScheme.error) }, onClick = {
+                                        service?.removeTrackFromPlaylist(selectedPlaylist.name, index)
+                                        playlistTrackMenuIndex = -1
+                                    })
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    TextButton(onClick = { selectedView = 0 }) { Text("‹ REPRODUCTOR") }
+                    OutlinedTextField(
+                        value = playlistSearch,
+                        onValueChange = { playlistSearch = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Buscar playlist") },
+                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                        singleLine = true,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = playlistNameDraft,
+                            onValueChange = { playlistNameDraft = it },
+                            modifier = Modifier.weight(1f),
+                            label = { Text("Nueva playlist") },
+                            singleLine = true,
+                        )
+                        Button(
+                            onClick = {
+                                if (service?.createPlaylist(playlistNameDraft) == true) playlistNameDraft = ""
+                            },
+                            enabled = playlistNameDraft.isNotBlank(),
+                        ) { Text("CREAR") }
+                    }
+                    if (playlists.isEmpty()) {
+                        Text("Crea playlists y añade pistas desde la cola.", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        val visiblePlaylists = playlists.filter { it.name.contains(playlistSearch.trim(), ignoreCase = true) }
+                        if (visiblePlaylists.isEmpty()) {
+                            Text("No hay playlists que coincidan con la búsqueda.", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                        }
+                        visiblePlaylists.forEach { playlist ->
+                            Surface(
+                                color = MaterialTheme.colorScheme.surface,
+                                shape = MaterialTheme.shapes.medium,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier.fillMaxWidth().clickable { selectedPlaylistName = playlist.name },
+                            ) {
+                                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(playlist.name, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                        Text("${playlist.trackCount} elementos", color = MutedText, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    Text("›", fontSize = 22.sp, color = MutedText)
                                 }
                             }
                         }
                     }
                 }
             }
-        } else if (playback.queue.isEmpty()) {
-            Text("Añade archivos de audio para empezar.", color = MutedText, style = MaterialTheme.typography.bodySmall)
-        } else {
-            playback.queue.forEachIndexed { index, title ->
-                Box(Modifier.fillMaxWidth()) {
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { service?.playQueueItem(index) },
-                                onLongClick = { contextMenuIndex = index },
-                            )
-                            .padding(vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text("%02d".format(index + 1), modifier = Modifier.width(34.dp), color = if (index == playback.currentIndex) MaterialTheme.colorScheme.primary else MutedText, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
-                        Text(title, modifier = Modifier.weight(1f), maxLines = 1, fontWeight = if (index == playback.currentIndex) FontWeight.Bold else FontWeight.Normal)
-                        Text("⋮", color = MutedText, fontSize = 20.sp)
-                    }
-                    DropdownMenu(
-                        expanded = contextMenuIndex == index,
-                        onDismissRequest = { contextMenuIndex = -1 },
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Reproducir a continuación") },
-                            onClick = {
-                                service?.playQueueItemNext(index)
-                                contextMenuIndex = -1
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Añadir a playlist") },
-                            enabled = playlists.isNotEmpty(),
-                            onClick = {
-                                playlistPickerIndex = index
-                                contextMenuIndex = -1
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Eliminar de la cola", color = MaterialTheme.colorScheme.error) },
-                            onClick = {
-                                service?.removeQueueItem(index)
-                                contextMenuIndex = -1
-                            },
-                        )
+
+            else -> Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 12.dp, bottom = 16.dp),
+            ) {
+                if (favorites.isEmpty()) {
+                    Text("Marca canciones con ♡ para guardarlas aquí.", color = MutedText)
+                } else {
+                    favorites.forEach { favorite ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { service?.playFavoriteTrack(favorite.uri) }) {
+                                Text(favorite.title, modifier = Modifier.weight(1f), maxLines = 1, color = MaterialTheme.colorScheme.onBackground)
+                            }
+                            TextButton(onClick = { favoriteToAdd = favorite }) { Text("A LISTA") }
+                            TextButton(onClick = { service?.removeFavorite(favorite.uri) }) { Text("♥", color = MaterialTheme.colorScheme.error) }
+                        }
                     }
                 }
             }
         }
-        Spacer(Modifier.height(26.dp))
     }
 
     if (playlistPickerIndex >= 0) {
@@ -507,7 +958,7 @@ private fun ExpandedPlayer(
                             },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("${playlist.name}  ·  ${playlist.trackCount} pistas", modifier = Modifier.fillMaxWidth())
+                            Text("${playlist.name}  ·  ${playlist.trackCount} elementos", modifier = Modifier.fillMaxWidth())
                         }
                     }
                 }
@@ -517,13 +968,113 @@ private fun ExpandedPlayer(
             },
         )
     }
+
+    if (isAddingQueueTracks && selectedPlaylist != null) {
+        AlertDialog(
+            onDismissRequest = { isAddingQueueTracks = false },
+            title = { Text("Añadir desde la cola") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    playback.queue.forEachIndexed { index, title ->
+                        TextButton(
+                            onClick = {
+                                service?.addQueueItemToPlaylist(index, selectedPlaylist.name)
+                                isAddingQueueTracks = false
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(title, modifier = Modifier.fillMaxWidth(), maxLines = 1) }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { isAddingQueueTracks = false }) { Text("CERRAR") } },
+        )
+    }
+
+    if (favoriteToAdd != null) {
+        AlertDialog(
+            onDismissRequest = { favoriteToAdd = null },
+            title = { Text("Añadir favorito a playlist") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    playlists.forEach { playlist ->
+                        TextButton(
+                            onClick = {
+                                favoriteToAdd?.let { service?.addFavoriteToPlaylist(it.uri, playlist.name) }
+                                favoriteToAdd = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(playlist.name, modifier = Modifier.fillMaxWidth()) }
+                    }
+                    if (playlists.isEmpty()) Text("Crea una playlist primero.", color = MutedText)
+                }
+            },
+            confirmButton = { TextButton(onClick = { favoriteToAdd = null }) { Text("CERRAR") } },
+        )
+    }
+
+    if (isRenamingPlaylist && selectedPlaylist != null) {
+        AlertDialog(
+            onDismissRequest = { isRenamingPlaylist = false },
+            title = { Text("Renombrar playlist") },
+            text = {
+                OutlinedTextField(
+                    value = renamePlaylistDraft,
+                    onValueChange = { renamePlaylistDraft = it },
+                    label = { Text("Nombre") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (service?.renamePlaylist(selectedPlaylist.name, renamePlaylistDraft) == true) {
+                        selectedPlaylistName = renamePlaylistDraft.trim()
+                        isRenamingPlaylist = false
+                    }
+                }, enabled = renamePlaylistDraft.isNotBlank()) { Text("GUARDAR") }
+            },
+            dismissButton = { TextButton(onClick = { isRenamingPlaylist = false }) { Text("CANCELAR") } },
+        )
+    }
+
+    if (isConfirmingPlaylistDelete && selectedPlaylist != null) {
+        AlertDialog(
+            onDismissRequest = { isConfirmingPlaylistDelete = false },
+            title = { Text("Eliminar playlist") },
+            text = { Text("Se eliminará '${selectedPlaylist.name}'. Las pistas originales no se borrarán.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    service?.deletePlaylist(selectedPlaylist.name)
+                    selectedPlaylistName = ""
+                    isConfirmingPlaylistDelete = false
+                }) { Text("ELIMINAR", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { isConfirmingPlaylistDelete = false }) { Text("CANCELAR") } },
+        )
+    }
+}
+
+@Composable
+private fun TrackArtwork(modifier: Modifier = Modifier, artworkData: ByteArray?) {
+    val bitmap = produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, artworkData) {
+        value = withContext(Dispatchers.IO) {
+            artworkData?.let { bytes -> BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }
+        }
+    }.value
+
+    Box(modifier.clip(MaterialTheme.shapes.medium).background(MaterialTheme.colorScheme.surfaceVariant)) {
+        if (bitmap != null) {
+            Image(bitmap, contentDescription = "Carátula del álbum", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        } else {
+            RadioArtwork(Modifier.fillMaxSize())
+        }
+    }
 }
 
 @Composable
 private fun RadioArtwork(modifier: Modifier = Modifier) {
     Canvas(
-        modifier.clip(RoundedCornerShape(12.dp)).background(
-            Brush.linearGradient(listOf(Color(0xFF34462F), Color(0xFF101715), Color(0xFF202E25))),
+        modifier.clip(MaterialTheme.shapes.medium).background(
+            Brush.linearGradient(listOf(Color(0xFF514033), Color(0xFF171615), Color(0xFF352A22))),
         ),
     ) {
         val center = this.center
@@ -531,7 +1082,7 @@ private fun RadioArtwork(modifier: Modifier = Modifier) {
         for (ring in 1..4) {
             val radius = unit * (0.13f + ring * 0.105f)
             drawArc(
-                color = if (ring % 2 == 0) Color(0xFF78965A) else Color(0xFFB9EF62),
+                color = if (ring % 2 == 0) Color(0xFFB87952) else Color(0xFFE3B66A),
                 startAngle = 205f,
                 sweepAngle = 130f,
                 useCenter = false,
@@ -540,21 +1091,61 @@ private fun RadioArtwork(modifier: Modifier = Modifier) {
                 style = Stroke(width = unit * 0.012f, cap = StrokeCap.Round),
             )
         }
-        drawCircle(Color(0xFFB9EF62), radius = unit * 0.105f, center = center)
+        drawCircle(Color(0xFFE3B66A), radius = unit * 0.105f, center = center)
         val playMark = Path().apply {
             moveTo(center.x - unit * 0.025f, center.y - unit * 0.042f)
             lineTo(center.x + unit * 0.045f, center.y)
             lineTo(center.x - unit * 0.025f, center.y + unit * 0.042f)
             close()
         }
-        drawPath(playMark, color = Color(0xFF101715))
+        drawPath(playMark, color = Color(0xFF171615))
     }
 }
 
 @Composable
-private fun StudioScreen(service: RadioEngineService?, meters: MeterSnapshot, stream: StreamSnapshot, mixLevels: MixLevels) {
+private fun StudioScreen(
+    service: RadioEngineService?,
+    meters: MeterSnapshot,
+    stream: StreamSnapshot,
+    mixLevels: MixLevels,
+    onToggleBroadcast: () -> Unit,
+    actionMessage: String,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.People, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Oyente en línea", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                val listenerStatus = when {
+                    !stream.isStreaming -> "Inicia una emisión para consultar oyentes"
+                    stream.activeListeners == null -> "No disponible en el servidor"
+                    stream.activeListeners == 0 -> "Sin oyentes conectados"
+                    stream.activeListeners == 1 -> "1 oyente activo"
+                    else -> "${stream.activeListeners} oyentes activos"
+                }
+                Text(listenerStatus, color = MutedText, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+            }
+            Text(
+                stream.activeListeners?.toString() ?: "—",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+    Spacer(Modifier.height(22.dp))
     SectionHeading("SEÑAL", "Monitor de audio")
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             MeterRow("ENTRADA", meters.inputDb)
             MeterRow("SALIDA", meters.outputDb)
@@ -574,7 +1165,12 @@ private fun StudioScreen(service: RadioEngineService?, meters: MeterSnapshot, st
         fontWeight = FontWeight.Bold,
     )
     Spacer(Modifier.height(10.dp))
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().height(330.dp)) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.large,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth().height(330.dp),
+    ) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 18.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             LiveFader(
                 label = "MICRÓFONO",
@@ -595,14 +1191,55 @@ private fun StudioScreen(service: RadioEngineService?, meters: MeterSnapshot, st
         }
     }
     Spacer(Modifier.height(20.dp))
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
-        Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Column {
-                Text(if (stream.isConnected) "Emisión activa" else if (stream.isStreaming) "Conectando a Icecast" else "Emisión detenida", fontWeight = FontWeight.SemiBold)
-                Text(stream.endpoint.ifBlank { "Configura tu servidor" }, style = MaterialTheme.typography.bodySmall, color = MutedText)
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                Text(
+                    when {
+                        stream.isConnected -> "Emisión activa"
+                        stream.isStreaming && stream.error.isNotBlank() -> "Reconectando a Icecast"
+                        stream.isStreaming -> "Conectando a Icecast"
+                        else -> "Emisión detenida"
+                    },
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    stream.endpoint.ifBlank { "Configura tu servidor" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MutedText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
-            TextButton(onClick = { service?.stopStreaming() }, enabled = stream.isStreaming) { Text("DETENER", color = MaterialTheme.colorScheme.error) }
+            Button(
+                onClick = onToggleBroadcast,
+                enabled = stream.isStreaming || service != null,
+                modifier = Modifier.width(120.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (stream.isStreaming) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                ),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+                Icon(
+                    imageVector = if (stream.isStreaming) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                    contentDescription = null,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(if (stream.isStreaming) "Detener" else "Emitir")
+            }
         }
+    }
+    if (actionMessage.isNotBlank()) {
+        Text(actionMessage, modifier = Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+    }
+    if (stream.error.isNotBlank()) {
+        Text(stream.error, modifier = Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -615,7 +1252,7 @@ private fun LiveFader(
     onGainChange: (Float) -> Unit,
     onToggleMute: () -> Unit,
 ) {
-    val stateColor = if (muted) Color(0xFFFFA66B) else Color(0xFFB9EF62)
+    val stateColor = if (muted) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(label, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.4.sp, maxLines = 1)
@@ -632,7 +1269,7 @@ private fun LiveFader(
             )
         }
         Surface(
-            color = if (muted) Color(0xFF3B281F) else Color(0xFF26351D),
+            color = MaterialTheme.colorScheme.surfaceVariant,
             shape = CircleShape,
             border = BorderStroke(1.dp, stateColor.copy(alpha = 0.9f)),
             shadowElevation = 7.dp,
@@ -706,7 +1343,11 @@ private fun LiveFader(
                 Text("Crea una lista desde la cola actual.", color = MutedText, style = MaterialTheme.typography.bodySmall)
             } else {
                 playlists.forEach { playlist ->
-                    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface,
+                        shape = MaterialTheme.shapes.medium,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    ) {
                         Column(Modifier.fillMaxWidth().padding(14.dp)) {
                             Text(playlist.name, fontWeight = FontWeight.SemiBold)
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -788,32 +1429,269 @@ private fun StudioScreen(service: RadioEngineService?, playback: PlaybackSnapsho
 */
 
 @Composable
-private fun AddTracksButton(service: RadioEngineService?, modifier: Modifier = Modifier, onResult: (Int) -> Unit) {
-    val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris.isEmpty()) {
-            onResult(0)
-        } else {
-            val tracks = uris.map { uri ->
-                try { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: SecurityException) { }
-                uri to displayName(context, uri)
-            }
-            onResult(service?.enqueueTracks(tracks) ?: -1)
-        }
-    }
-    Button(
-        onClick = { picker.launch(arrayOf("audio/*")) },
+private fun AddTracksButton(
+    service: RadioEngineService?,
+    modifier: Modifier = Modifier,
+    onResult: (AudioImportResult) -> Unit,
+) {
+    AudioImportButton(
+        label = "＋  AÑADIR AUDIO",
         modifier = modifier,
         enabled = service != null,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-        ),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Text("＋  AÑADIR CANCIONES", fontWeight = FontWeight.Bold, fontSize = 11.sp, maxLines = 1)
+        onImport = { selection ->
+            if (selection.source == AudioImportSource.FILES) {
+                AudioImportResult(
+                    service?.enqueueTracks(selection.tracks) ?: -1,
+                    AudioImportSource.FILES,
+                )
+            } else {
+                val added = selection.folderUri?.let { treeUri ->
+                    service?.enqueueRandomFolder(treeUri, selection.folderName, selection.tracks)
+                } == true
+                AudioImportResult(
+                    trackCount = if (added) 1 else 0,
+                    source = AudioImportSource.FOLDER,
+                    error = if (!added && selection.tracks.isNotEmpty()) {
+                        "Se encontraron ${selection.tracks.size} pistas, pero no se pudieron añadir a la cola."
+                    } else {
+                        null
+                    },
+                    folderAdded = added,
+                    folderName = selection.folderName,
+                    folderTrackCount = selection.tracks.size,
+                )
+            }
+        },
+        onResult = onResult,
+    )
+}
+
+@Composable
+private fun AddTracksToPlaylistButton(
+    playlistName: String,
+    service: RadioEngineService?,
+    modifier: Modifier = Modifier,
+    onResult: (AudioImportResult) -> Unit,
+) {
+    AudioImportButton(
+        label = "IMPORTAR AUDIO",
+        modifier = modifier,
+        enabled = service != null,
+        outlined = true,
+        onImport = { selection ->
+            if (selection.source == AudioImportSource.FILES) {
+                AudioImportResult(
+                    service?.addTracksToPlaylist(playlistName, selection.tracks) ?: 0,
+                    AudioImportSource.FILES,
+                )
+            } else {
+                val added = selection.folderUri?.let { treeUri ->
+                    service?.addFolderToPlaylist(playlistName, treeUri, selection.folderName, selection.tracks)
+                } == true
+                AudioImportResult(
+                    trackCount = if (added) 1 else 0,
+                    source = AudioImportSource.FOLDER,
+                    error = if (!added && selection.tracks.isNotEmpty()) {
+                        "Se encontraron ${selection.tracks.size} pistas, pero no se pudieron añadir a la playlist."
+                    } else {
+                        null
+                    },
+                    folderAdded = added,
+                    folderName = selection.folderName,
+                    folderTrackCount = selection.tracks.size,
+                )
+            }
+        },
+        onResult = onResult,
+    )
+}
+
+private enum class AudioImportSource { FILES, FOLDER }
+
+private data class AudioImportSelection(
+    val source: AudioImportSource,
+    val tracks: List<Pair<Uri, String>>,
+    val folderUri: Uri? = null,
+    val folderName: String = "",
+)
+
+private data class AudioImportResult(
+    val trackCount: Int,
+    val source: AudioImportSource,
+    val error: String? = null,
+    val folderAdded: Boolean = false,
+    val folderName: String = "",
+    val folderTrackCount: Int = 0,
+)
+
+@Composable
+private fun AudioImportButton(
+    label: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean,
+    outlined: Boolean = false,
+    onImport: (AudioImportSelection) -> AudioImportResult,
+    onResult: (AudioImportResult) -> Unit,
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var menuExpanded by remember { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
+
+    val filesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) {
+            coroutineScope.launch {
+                importing = true
+                try {
+                    val tracks = withContext(Dispatchers.IO) {
+                        uris.map { uri ->
+                            context.contentResolver.takePersistableUriPermission(
+                                uri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                            )
+                            uri to displayName(context, uri)
+                        }
+                    }
+                    onResult(onImport(AudioImportSelection(AudioImportSource.FILES, tracks)))
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: SecurityException) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudo conservar el acceso a los archivos seleccionados", error)
+                    onResult(AudioImportResult(0, AudioImportSource.FILES, "No se pudo acceder a los archivos seleccionados."))
+                } catch (error: Exception) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudieron procesar los archivos seleccionados", error)
+                    onResult(AudioImportResult(0, AudioImportSource.FILES, "No se pudieron procesar los archivos seleccionados."))
+                } finally {
+                    importing = false
+                }
+            }
+        }
+    }
+
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri != null) {
+            coroutineScope.launch {
+                importing = true
+                try {
+                    val selection = withContext(Dispatchers.IO) {
+                        context.contentResolver.takePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                        AudioImportSelection(
+                            source = AudioImportSource.FOLDER,
+                            tracks = collectAudioTracks(context, treeUri),
+                            folderUri = treeUri,
+                            folderName = displayName(context, treeUri),
+                        )
+                    }
+                    onResult(onImport(selection))
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: SecurityException) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudo conservar el acceso a la carpeta seleccionada", error)
+                    onResult(AudioImportResult(0, AudioImportSource.FOLDER, "No se pudo conservar el acceso a la carpeta: ${error.localizedMessage ?: "permiso denegado"}."))
+                } catch (error: IOException) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudieron leer las pistas de la carpeta seleccionada", error)
+                    onResult(AudioImportResult(0, AudioImportSource.FOLDER, "No se pudo leer la carpeta: ${error.localizedMessage ?: "error de lectura"}."))
+                } catch (error: Exception) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudo procesar la carpeta seleccionada", error)
+                    onResult(AudioImportResult(0, AudioImportSource.FOLDER, "No se pudo procesar la carpeta: ${error.localizedMessage ?: error.javaClass.simpleName}."))
+                } finally {
+                    importing = false
+                }
+            }
+        }
+    }
+
+    Box(modifier) {
+        val buttonModifier = if (outlined) Modifier.fillMaxWidth() else Modifier
+        if (outlined) {
+            OutlinedButton(
+                onClick = { menuExpanded = true },
+                enabled = enabled && !importing,
+                modifier = buttonModifier,
+            ) {
+                Text(if (importing) "BUSCANDO…" else "$label  ▾", maxLines = 1)
+            }
+        } else {
+            Button(
+                onClick = { menuExpanded = true },
+                modifier = buttonModifier,
+                enabled = enabled && !importing,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                ),
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Text(if (importing) "BUSCANDO…" else "$label  ▾", fontWeight = FontWeight.Bold, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+            DropdownMenuItem(
+                text = { Text("Archivos de audio") },
+                onClick = {
+                    menuExpanded = false
+                    filesPicker.launch(arrayOf("audio/*"))
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Carpeta de música") },
+                onClick = {
+                    menuExpanded = false
+                    folderPicker.launch(null)
+                },
+            )
+        }
     }
 }
+
+private fun collectAudioTracks(context: Context, treeUri: Uri): List<Pair<Uri, String>> {
+    val resolver = context.contentResolver
+    val pendingDocumentIds = ArrayDeque<String>().apply {
+        addLast(DocumentsContract.getTreeDocumentId(treeUri))
+    }
+    val visitedDocumentIds = mutableSetOf<String>()
+    val audioTracks = mutableListOf<Pair<Uri, String>>()
+    val projection = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+    )
+
+    while (pendingDocumentIds.isNotEmpty()) {
+        val parentDocumentId = pendingDocumentIds.removeFirst()
+        if (!visitedDocumentIds.add(parentDocumentId)) continue
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+        val cursor = resolver.query(childrenUri, projection, null, null, null)
+            ?: throw IOException("El proveedor de documentos no pudo enumerar la carpeta.")
+        cursor.use {
+            val idColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            if (idColumn < 0) throw IOException("El proveedor de documentos no devolvió identificadores.")
+            val nameColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (it.moveToNext()) {
+                val documentId = it.getString(idColumn) ?: continue
+                val displayName = if (nameColumn >= 0) it.getString(nameColumn).orEmpty() else ""
+                val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+                val mimeType = (if (mimeColumn >= 0) it.getString(mimeColumn).orEmpty() else "")
+                    .ifBlank { runCatching { resolver.getType(documentUri) }.getOrNull().orEmpty() }
+                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    pendingDocumentIds.addLast(documentId)
+                } else if (mimeType.startsWith("audio/") || isSupportedAudioFile(displayName)) {
+                    audioTracks += documentUri to displayName.ifBlank { documentId.substringAfterLast('/') }
+                }
+            }
+        }
+    }
+    return audioTracks.sortedBy { (_, title) -> title.lowercase() }
+}
+
+private fun isSupportedAudioFile(name: String): Boolean =
+    name.substringAfterLast('.', "").lowercase() in setOf("aac", "flac", "m4a", "mp3", "ogg", "opus", "wav")
+
+private const val AUDIO_IMPORT_TAG = "RadioAudioImport"
 
 @Composable
 private fun DspScreen(service: RadioEngineService?) {
@@ -826,7 +1704,11 @@ private fun DspScreen(service: RadioEngineService?) {
     fun applyParameters() = service?.engine?.updatePipeline(DspParameters(enabled, target, maxGain, attack, release, output))
 
     SectionHeading("PROCESAMIENTO", "Cadena DSP")
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
         Column(Modifier.padding(16.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column {
@@ -937,7 +1819,11 @@ private fun BroadcastScreen(stream: StreamSnapshot) {
     }
 
     SectionHeading("DESTINO", "Servidor Icecast")
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(8.dp)) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (profiles.isNotEmpty()) {
                 Text("PERFILES GUARDADOS", fontSize = 10.sp, color = MutedText, fontWeight = FontWeight.Bold)
@@ -1015,7 +1901,18 @@ private fun BroadcastScreen(stream: StreamSnapshot) {
                 }, Modifier.fillMaxWidth()) { Text("INICIAR EMISIÓN") }
             }
             if (stream.isStreaming) {
-                Text(if (stream.isConnected) "Conectado · ${stream.endpoint}" else "Intentando conectar · ${stream.endpoint}", color = if (stream.isConnected) LiveGreen else MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    when {
+                        stream.isConnected -> "Conectado · ${stream.endpoint}"
+                        stream.isStreaming && stream.error.isNotBlank() -> "Reconectando · ${stream.endpoint}"
+                        stream.isStreaming -> "Intentando conectar · ${stream.endpoint}"
+                        else -> stream.endpoint
+                    },
+                    color = if (stream.isConnected) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 if (stream.error.isNotBlank()) Text(stream.error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
         }
@@ -1047,9 +1944,21 @@ private fun MeterRow(label: String, levelDb: Float) {
 
 @Composable
 private fun SectionHeading(eyebrow: String, title: String) {
-    Column(Modifier.padding(bottom = 10.dp)) {
-        Text(eyebrow, color = MaterialTheme.colorScheme.primary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
-        Text(title, style = MaterialTheme.typography.titleLarge)
+    Row(
+        Modifier.padding(bottom = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Spacer(
+            Modifier
+                .width(3.dp)
+                .height(38.dp)
+                .background(MaterialTheme.colorScheme.secondary, RoundedCornerShape(2.dp)),
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(eyebrow, color = MaterialTheme.colorScheme.secondary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+            Text(title, style = MaterialTheme.typography.titleLarge)
+        }
     }
 }
 
@@ -1059,10 +1968,22 @@ private fun HorizontalRule() {
 }
 
 private fun displayName(context: Context, uri: Uri): String {
-    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-        if (it.moveToFirst()) return it.getString(0) ?: "Archivo de audio"
+    val queriedName = try {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameColumn >= 0 && cursor.moveToFirst()) cursor.getString(nameColumn) else null
+        }
+    } catch (error: Exception) {
+        Log.w(AUDIO_IMPORT_TAG, "El proveedor no pudo devolver el nombre del documento", error)
+        null
     }
-    return uri.lastPathSegment?.substringAfterLast('/') ?: "Archivo de audio"
+    if (!queriedName.isNullOrBlank()) return queriedName
+    val fallbackName = if (DocumentsContract.isTreeUri(uri)) {
+        runCatching { DocumentsContract.getTreeDocumentId(uri).substringAfterLast('/').substringAfter(':') }.getOrNull()
+    } else {
+        uri.lastPathSegment?.substringAfterLast('/')
+    }
+    return fallbackName?.takeIf(String::isNotBlank) ?: "Archivo de audio"
 }
 
 private fun dbLabel(value: Float): String = if (value <= -119f) "−∞ dB" else "%.1f dB".format(value)
@@ -1072,5 +1993,5 @@ private fun timeLabel(milliseconds: Long): String {
     return "%d:%02d".format(seconds / 60, seconds % 60)
 }
 
-private val LiveGreen = Color(0xFFB9EF62)
-private val MutedText = Color(0xFF87918B)
+private val MutedText: Color
+    @Composable get() = MaterialTheme.colorScheme.onSurfaceVariant

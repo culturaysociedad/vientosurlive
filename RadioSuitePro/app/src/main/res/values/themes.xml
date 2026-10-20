@@ -2,7 +2,7 @@
 <resources>
     <style name="Theme.RadioSuitePro" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">@color/radio_teal</item>
+        <item name="android:colorAccent">@color/radio_brick</item>
         <item name="android:statusBarColor">@color/radio_mist</item>
         <item name="android:navigationBarColor">@color/radio_mist</item>
         <item name="android:windowLightStatusBar">true</item>

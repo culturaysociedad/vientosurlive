@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="radio_teal">#087E83</color>
-    <color name="radio_ink">#18343A</color>
-    <color name="radio_mist">#F1F5F2</color>
+    <color name="radio_brick">#713D2F</color>
+    <color name="radio_ink">#29221E</color>
+    <color name="radio_mist">#F3EFE7</color>
     <color name="launcher_background">#101715</color>
 </resources>

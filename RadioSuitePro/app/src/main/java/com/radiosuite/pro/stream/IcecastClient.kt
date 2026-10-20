@@ -1,15 +1,11 @@
 package com.radiosuite.pro.stream
 
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -35,19 +31,22 @@ class IcecastClient(
         private set
     private var socket: Socket? = null
     private var out: OutputStream? = null
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .build()
+    @Volatile private var worker: Thread? = null
 
     /** Inicia el bucle de emisión en segundo plano. */
+    @Synchronized
     fun start() {
+        if (shouldRun) return
         shouldRun = true
-        thread(name = "IcecastClient", isDaemon = true) { runLoop() }
+        worker = thread(name = "IcecastClient", isDaemon = true) { runLoop() }
     }
 
+    @Synchronized
     fun stop() {
         shouldRun = false
+        connected = false
+        worker?.interrupt()
+        worker = null
         closeConnection()
     }
 
@@ -63,7 +62,9 @@ class IcecastClient(
                 flush()
             }
         } catch (e: IOException) {
+            lastError = e.message ?: "Se perdió la conexión con Icecast durante el envío"
             connected = false
+            closeConnection()
         }
     }
 
@@ -77,55 +78,77 @@ class IcecastClient(
                 while (shouldRun && connected) {
                     Thread.sleep(50)
                 }
+            } catch (e: InterruptedException) {
+                if (shouldRun) Thread.currentThread().interrupt()
+                break
             } catch (e: IOException) {
                 connected = false
                 lastError = e.message ?: "No se pudo conectar con Icecast"
                 closeConnection()
             }
             if (shouldRun) {
-                Thread.sleep(backoffMs)
+                closeConnection()
+                try {
+                    Thread.sleep(backoffMs)
+                } catch (_: InterruptedException) {
+                    break
+                }
                 backoffMs = (backoffMs * 2).coerceAtMost(30_000L) // backoff exponencial, máx 30s
             }
         }
+        closeConnection()
     }
 
     private fun connect() {
-        val s = Socket(host, port)
-        s.soTimeout = 10_000
-        s.tcpNoDelay = true
-        s.keepAlive = true
+        val s = Socket()
         socket = s
-        out = s.getOutputStream()
-        val contentType = when (codec) {
-            StreamCodec.Opus   -> "application/ogg"
-            StreamCodec.Vorbis -> "application/ogg"
-            StreamCodec.Mp3    -> "audio/mpeg"
+        try {
+            s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            s.soTimeout = RESPONSE_TIMEOUT_MS
+            s.tcpNoDelay = true
+            s.keepAlive = true
+            out = s.getOutputStream()
+            val contentType = when (codec) {
+                StreamCodec.Opus   -> "application/ogg"
+                StreamCodec.Vorbis -> "application/ogg"
+                StreamCodec.Mp3    -> "audio/mpeg"
+            }
+            val authority = if (host.count { it == ':' } > 1 && !host.startsWith("[")) "[$host]" else host
+            val request = "SOURCE ${mount} HTTP/1.1\r\n" +
+                "Host: ${authority}:${port}\r\n" +
+                "Authorization: Basic ${java.util.Base64.getEncoder().encodeToString("source:${password}".toByteArray())}\r\n" +
+                "Content-Type: ${contentType}\r\n" +
+                "ice-bitrate: ${bitrate}\r\n" +
+                "User-Agent: RadioSuitePro/1.0\r\n" +
+                "\r\n"
+            out?.apply {
+                write(request.toByteArray())
+                flush()
+            }
+            val response = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII)).readLine()
+                ?: throw IOException("Icecast cerró la conexión sin responder")
+            val statusCode = response.split(' ').getOrNull(1)?.toIntOrNull()
+            if (statusCode != 200) throw IOException("Icecast respondió: $response")
+            s.soTimeout = 0
+            lastError = ""
+            connected = true
+        } catch (error: IOException) {
+            closeConnection()
+            throw error
         }
-        val request = "SOURCE ${mount} HTTP/1.1\r\n" +
-            "Host: ${host}:${port}\r\n" +
-            "Authorization: Basic ${java.util.Base64.getEncoder().encodeToString("source:${password}".toByteArray())}\r\n" +
-            "Content-Type: ${contentType}\r\n" +
-            "ice-bitrate: ${bitrate}\r\n" +
-            "User-Agent: RadioSuitePro/1.0\r\n" +
-            "\r\n"
-        out?.apply {
-            write(request.toByteArray())
-            flush()
-        }
-        val response = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII)).readLine()
-            ?: throw IOException("Icecast cerró la conexión sin responder")
-        val statusCode = response.split(' ').getOrNull(1)?.toIntOrNull()
-        if (statusCode != 200) throw IOException("Icecast respondió: $response")
-        s.soTimeout = 0
-        lastError = ""
-        connected = true
     }
 
     @Synchronized
     private fun closeConnection() {
+        connected = false
         try { out?.close() } catch (_: IOException) {}
         try { socket?.close() } catch (_: IOException) {}
         out = null
         socket = null
+    }
+
+    private companion object {
+        const val CONNECT_TIMEOUT_MS = 10_000
+        const val RESPONSE_TIMEOUT_MS = 10_000
     }
 }
