@@ -1,6 +1,9 @@
 package com.radiosuite.pro.ui
 
 import android.Manifest
+import android.app.AlarmManager
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -13,6 +16,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -122,6 +126,8 @@ import com.radiosuite.pro.service.PlaybackSnapshot
 import com.radiosuite.pro.service.FavoriteTrack
 import com.radiosuite.pro.service.MixLevels
 import com.radiosuite.pro.service.RadioEngineService
+import com.radiosuite.pro.service.ClockAudioFolderSnapshot
+import com.radiosuite.pro.service.ScheduledRadioEvent
 import com.radiosuite.pro.service.SavedPlaylistSummary
 import com.radiosuite.pro.service.StreamSnapshot
 import com.radiosuite.pro.service.SwiperSnapshot
@@ -133,12 +139,26 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 private data class MeterSnapshot(
     val inputDb: Float = -120f,
     val outputDb: Float = -120f,
     val rmsDb: Float = -120f,
     val agcGainDb: Float = 0f,
+)
+
+private data class ClockAudioFolderImport(
+    val folderName: String,
+    val phraseAudio: Uri?,
+    val hourFiles: Map<Int, Uri>,
+    val minuteFiles: Map<Int, Uri>,
+    val duplicateSegments: Set<String>,
 )
 
 class MainActivity : ComponentActivity() {
@@ -234,6 +254,8 @@ private fun RadioSuiteConsole(
     var playlists by remember(service) { mutableStateOf(emptyList<SavedPlaylistSummary>()) }
     var favorites by remember(service) { mutableStateOf(emptyList<FavoriteTrack>()) }
     var swiperStatus by remember(service) { mutableStateOf(SwiperSnapshot()) }
+    var clockAudioFolderStatus by remember(service) { mutableStateOf(ClockAudioFolderSnapshot()) }
+    var scheduledEvents by remember(service) { mutableStateOf(emptyList<ScheduledRadioEvent>()) }
     var pendingStudioProfile by remember { mutableStateOf<BroadcastProfile?>(null) }
     var studioActionMessage by remember { mutableStateOf("") }
 
@@ -293,6 +315,8 @@ private fun RadioSuiteConsole(
     LaunchedEffect(service) { service?.savedPlaylists?.collectLatest { playlists = it } }
     LaunchedEffect(service) { service?.favoriteTracks?.collectLatest { favorites = it } }
     LaunchedEffect(service) { service?.swiperStatus?.collectLatest { swiperStatus = it } }
+    LaunchedEffect(service) { service?.clockAudioFolderStatus?.collectLatest { clockAudioFolderStatus = it } }
+    LaunchedEffect(service) { service?.scheduledEvents?.collectLatest { scheduledEvents = it } }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -354,6 +378,8 @@ private fun RadioSuiteConsole(
                 playlists = playlists,
                 favorites = favorites,
                 swiperStatus = swiperStatus,
+                clockAudioFolderStatus = clockAudioFolderStatus,
+                scheduledEvents = scheduledEvents,
                 onClose = { playerExpanded = false },
             )
         }
@@ -455,6 +481,8 @@ private fun ExpandedPlayer(
     playlists: List<SavedPlaylistSummary>,
     favorites: List<FavoriteTrack>,
     swiperStatus: SwiperSnapshot,
+    clockAudioFolderStatus: ClockAudioFolderSnapshot,
+    scheduledEvents: List<ScheduledRadioEvent>,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -477,7 +505,31 @@ private fun ExpandedPlayer(
     var speedMenuExpanded by remember { mutableStateOf(false) }
     var playerMenuExpanded by remember { mutableStateOf(false) }
     var queueSearch by rememberSaveable { mutableStateOf("") }
+    var eventNameDraft by rememberSaveable { mutableStateOf("") }
+    var eventAudioUri by rememberSaveable { mutableStateOf("") }
+    var eventAudioTitle by rememberSaveable { mutableStateOf("") }
+    var eventDateDraft by rememberSaveable {
+        mutableStateOf(LocalDateTime.now().plusHours(1).withMinute(0).toLocalDate().toString())
+    }
+    var eventHourDraft by rememberSaveable {
+        mutableIntStateOf(LocalDateTime.now().plusHours(1).hour)
+    }
+    var eventMinuteDraft by rememberSaveable { mutableIntStateOf(0) }
     val selectedPlaylist = playlists.firstOrNull { it.name == selectedPlaylistName }
+
+    val eventAudioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                eventAudioUri = uri.toString()
+                eventAudioTitle = displayName(context, uri)
+                addMessage = "Audio seleccionado: $eventAudioTitle"
+            } catch (error: Exception) {
+                Log.e(AUDIO_IMPORT_TAG, "No se pudo guardar el acceso al audio del evento", error)
+                addMessage = "No se pudo conservar el acceso al archivo. Selecciónalo desde una carpeta local."
+            }
+        }
+    }
 
     val swiperFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
         if (treeUri != null) {
@@ -502,6 +554,88 @@ private fun ExpandedPlayer(
                 } catch (error: Exception) {
                     Log.e(AUDIO_IMPORT_TAG, "No se pudo configurar la carpeta Swiper", error)
                     addMessage = "No se pudo leer la carpeta para Swiper."
+                }
+            }
+        }
+    }
+
+    val clockAudioFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri != null) {
+            coroutineScope.launch {
+                addMessage = "Buscando audios 00–23…"
+                try {
+                    val folder = withContext(Dispatchers.IO) {
+                        context.contentResolver.takePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                        val candidates = collectClockAudioFiles(context, treeUri)
+                        val phraseCandidates = candidates.filter { (path, _) ->
+                            path.split('/').let { parts ->
+                                parts.size == 1 && parts.single().substringBeforeLast('.', parts.single())
+                                    .equals("frase", ignoreCase = true)
+                            }
+                        }
+                        val hourMatches = candidates.mapNotNull { (path, uri) ->
+                            val parts = path.split('/')
+                            if (parts.size != 2 || !parts[0].equals("horas", ignoreCase = true)) return@mapNotNull null
+                            parts[1].substringBeforeLast('.', parts[1])
+                                .takeIf { it.matches(Regex("(?:[01][0-9]|2[0-3])")) }
+                                ?.toIntOrNull()
+                                ?.let { it to uri }
+                        }.groupBy({ it.first }, { it.second })
+                        val minuteMatches = candidates.mapNotNull { (path, uri) ->
+                            val parts = path.split('/')
+                            if (parts.size != 2 || !parts[0].equals("minutos", ignoreCase = true)) return@mapNotNull null
+                            parts[1].substringBeforeLast('.', parts[1])
+                                .takeIf { it.matches(Regex("[0-5][0-9]")) }
+                                ?.toIntOrNull()
+                                ?.let { it to uri }
+                        }.groupBy({ it.first }, { it.second })
+                        val duplicates = buildSet {
+                            if (phraseCandidates.size > 1) add("frase")
+                            hourMatches.filterValues { it.size > 1 }.keys.forEach { add("hora %02d".format(it)) }
+                            minuteMatches.filterValues { it.size > 1 }.keys.forEach { add("minuto %02d".format(it)) }
+                        }
+                        ClockAudioFolderImport(
+                            folderName = displayName(context, treeUri),
+                            phraseAudio = phraseCandidates.singleOrNull()?.second,
+                            hourFiles = hourMatches.filterValues { it.size == 1 }.mapValues { it.value.single() },
+                            minuteFiles = minuteMatches.filterValues { it.size == 1 }.mapValues { it.value.single() },
+                            duplicateSegments = duplicates,
+                        )
+                    }
+                    val configured = folder.duplicateSegments.isEmpty() &&
+                        service?.configureClockAudioFolder(
+                            folder.folderName,
+                            folder.phraseAudio,
+                            folder.hourFiles,
+                            folder.minuteFiles,
+                        ) == true
+                    val missingHours = (0..23).filterNot(folder.hourFiles::containsKey)
+                    val missingMinutes = (0..59).filterNot(folder.minuteFiles::containsKey)
+                    addMessage = when {
+                        folder.duplicateSegments.isNotEmpty() -> "Hay segmentos duplicados: " +
+                            folder.duplicateSegments.sorted().joinToString(", ") +
+                            ". Deja un solo archivo por segmento y vuelve a cargar la carpeta."
+                        !configured -> "No se encontró frase.mp3, horas/00–23 y minutos/00–59."
+                        else -> {
+                            val missing = buildList {
+                                if (folder.phraseAudio == null) add("frase.mp3")
+                                if (missingHours.isNotEmpty()) add("${missingHours.size} horas")
+                                if (missingMinutes.isNotEmpty()) add("${missingMinutes.size} minutos")
+                            }
+                            "Locución personalizada activa: ${folder.folderName} " +
+                                "(${folder.hourFiles.size}/24 horas, ${folder.minuteFiles.size}/60 minutos)" +
+                                if (missing.isEmpty()) "." else ". Faltan ${missing.joinToString(", ")}; " +
+                                    "si falta un segmento de la hora actual, se usará TTS completo."
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    Log.e(AUDIO_IMPORT_TAG, "No se pudo configurar la carpeta de locuciones", error)
+                    addMessage = "No se pudo leer la carpeta de locuciones."
                 }
             }
         }
@@ -549,6 +683,13 @@ private fun ExpandedPlayer(
                         },
                     )
                     DropdownMenuItem(
+                        text = { Text("Eventos programados") },
+                        onClick = {
+                            selectedView = 4
+                            playerMenuExpanded = false
+                        },
+                    )
+                    DropdownMenuItem(
                         text = { Text(if (swiperStatus.isConfigured) "Cambiar Swiper" else "Añadir Swiper") },
                         leadingIcon = { Icon(Icons.Filled.Radio, contentDescription = null) },
                         onClick = {
@@ -573,6 +714,40 @@ private fun ExpandedPlayer(
                         )
                     }
                     DropdownMenuItem(
+                        text = { Text(if (clockAudioFolderStatus.isConfigured) "Cambiar audios de hora" else "Cargar audios de hora") },
+                        onClick = {
+                            playerMenuExpanded = false
+                            clockAudioFolderPicker.launch(null)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Estructura: frase.mp3, horas/00–23 y minutos/00–59. Si falta un segmento se usa TTS completo.") },
+                        enabled = false,
+                        onClick = {},
+                    )
+                    if (clockAudioFolderStatus.isConfigured) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    "Audios · ${clockAudioFolderStatus.folderName} " +
+                                        "(${clockAudioFolderStatus.configuredHours.size}/24 h, " +
+                                        "${clockAudioFolderStatus.configuredMinutes.size}/60 min)",
+                                    maxLines = 1,
+                                )
+                            },
+                            enabled = false,
+                            onClick = {},
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Usar solo TTS") },
+                            onClick = {
+                                service?.clearClockAudioFolder()
+                                playerMenuExpanded = false
+                                addMessage = "Carpeta de locuciones desactivada. Se usará TTS."
+                            },
+                        )
+                    }
+                    DropdownMenuItem(
                         text = { Text("Cerrar reproductor") },
                         onClick = {
                             playerMenuExpanded = false
@@ -583,8 +758,29 @@ private fun ExpandedPlayer(
             }
         }
 
-        ScrollableTabRow(selectedTabIndex = if (selectedView == 3) 1 else 0, edgePadding = 0.dp) {
-            listOf("Ahora" to 0, "Favoritos · ${favorites.size}" to 3).forEach { (label, targetView) ->
+        if (playback.errorMessage.isNotBlank()) {
+            Text(
+                playback.errorMessage,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (addMessage.isNotBlank()) {
+            Text(
+                addMessage,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        ScrollableTabRow(selectedTabIndex = when (selectedView) {
+            3 -> 1
+            4 -> 2
+            else -> 0
+        }, edgePadding = 0.dp) {
+            listOf("Ahora" to 0, "Favoritos · ${favorites.size}" to 3, "Eventos · ${scheduledEvents.size}" to 4).forEach { (label, targetView) ->
                 Tab(
                     selected = selectedView == targetView,
                     onClick = { selectedView = targetView },
@@ -593,6 +789,7 @@ private fun ExpandedPlayer(
                         Icon(
                             imageVector = when (targetView) {
                                 0 -> Icons.Filled.PlayCircle
+                                4 -> Icons.Filled.Radio
                                 else -> Icons.Filled.Favorite
                             },
                             contentDescription = null,
@@ -736,6 +933,16 @@ private fun ExpandedPlayer(
                                 else -> "El reproductor no está listo; vuelve a intentarlo."
                             }
                         }
+                        TextButton(
+                            onClick = {
+                                addMessage = if (service?.enqueueClockAnnouncement() == true) {
+                                    "Se añadió la locución de hora a la cola."
+                                } else {
+                                    "No se pudo añadir la locución de hora."
+                                }
+                            },
+                            enabled = service != null,
+                        ) { Text("＋ HORA") }
                         TextButton(onClick = { service?.clearQueue() }, enabled = playback.queueSize > 0) { Text("VACIAR") }
                     }
                 }
@@ -747,7 +954,6 @@ private fun ExpandedPlayer(
                     leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
                     singleLine = true,
                 )
-                if (addMessage.isNotBlank()) Text(addMessage, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
                 if (playback.queue.isEmpty()) {
                     Text("Añade archivos de audio para empezar.", modifier = Modifier.padding(top = 20.dp), color = MutedText)
                 } else if (visibleQueue.isEmpty()) {
@@ -828,13 +1034,23 @@ private fun ExpandedPlayer(
                             }
                             OutlinedButton(onClick = { isAddingQueueTracks = true }, enabled = playback.queueSize > 0, modifier = Modifier.weight(1f)) { Text("DESDE COLA") }
                         }
+                        OutlinedButton(
+                            onClick = {
+                                addMessage = if (service?.addClockAnnouncementToPlaylist(selectedPlaylist.name) == true) {
+                                    "Se añadió la locución de hora a la playlist."
+                                } else {
+                                    "No se pudo añadir la locución de hora a la playlist."
+                                }
+                            },
+                            enabled = service != null,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("＋ AÑADIR LOCUCIÓN DE HORA") }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                             TextButton(onClick = { service?.appendPlaylist(selectedPlaylist.name) }) { Text("AÑADIR A COLA") }
                             TextButton(onClick = { service?.loadPlaylist(selectedPlaylist.name) }, enabled = selectedPlaylist.trackCount > 0) { Text("REPRODUCIR") }
                             TextButton(onClick = { service?.playPlaylistRandom(selectedPlaylist.name) }, enabled = selectedPlaylist.trackCount > 0) { Text("ALEATORIA") }
                         }
                     }
-                    if (addMessage.isNotBlank()) Text(addMessage, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
                     if (selectedPlaylist.tracks.isEmpty()) {
                         Text("Esta playlist está vacía.", color = MutedText, style = MaterialTheme.typography.bodySmall)
                     } else {
@@ -846,7 +1062,11 @@ private fun ExpandedPlayer(
                                 ) {
                                     Text("%02d".format(index + 1), modifier = Modifier.width(38.dp), color = MutedText, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
                                         Text(
-                                            if (track.isFolder) "Carpeta · ${track.title} (${track.folderTrackCount} pistas)" else track.title,
+                                            when {
+                                                track.isClockAnnouncement -> track.title
+                                                track.isFolder -> "Carpeta · ${track.title} (${track.folderTrackCount} pistas)"
+                                                else -> track.title
+                                            },
                                             modifier = Modifier.weight(1f),
                                             maxLines = 1,
                                         )
@@ -924,7 +1144,7 @@ private fun ExpandedPlayer(
                 }
             }
 
-            else -> Column(
+            3 -> Column(
                 Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 12.dp, bottom = 16.dp),
             ) {
                 if (favorites.isEmpty()) {
@@ -941,8 +1161,147 @@ private fun ExpandedPlayer(
                     }
                 }
             }
+
+            4 -> Column(
+                    Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(top = 12.dp, bottom = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("Programar evento", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "El audio se añadirá después de la pista que esté sonando a la hora programada.",
+                        color = MutedText,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OutlinedTextField(
+                        value = eventNameDraft,
+                        onValueChange = { eventNameDraft = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Nombre del evento (publicidad o micro)") },
+                        singleLine = true,
+                    )
+                    OutlinedButton(
+                        onClick = { eventAudioPicker.launch(arrayOf("audio/*")) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (eventAudioTitle.isBlank()) "SELECCIONAR AUDIO" else "AUDIO · $eventAudioTitle", maxLines = 1)
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                val date = LocalDate.parse(eventDateDraft)
+                                DatePickerDialog(
+                                    context,
+                                    { _, year, month, day ->
+                                        eventDateDraft = LocalDate.of(year, month + 1, day).toString()
+                                    },
+                                    date.year,
+                                    date.monthValue - 1,
+                                    date.dayOfMonth,
+                                ).show()
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("FECHA · ${LocalDate.parse(eventDateDraft).format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))}")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                TimePickerDialog(
+                                    context,
+                                    { _, hour, minute ->
+                                        eventHourDraft = hour
+                                        eventMinuteDraft = minute
+                                    },
+                                    eventHourDraft,
+                                    eventMinuteDraft,
+                                    true,
+                                ).show()
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("HORA · %02d:%02d".format(eventHourDraft, eventMinuteDraft))
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            val alarmManager = context.getSystemService(AlarmManager::class.java)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
+                                addMessage = "Activa las alarmas exactas en Ajustes y vuelve a programar el evento."
+                                try {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                            Uri.parse("package:${context.packageName}"),
+                                        ),
+                                    )
+                                } catch (error: Exception) {
+                                    Log.e(AUDIO_IMPORT_TAG, "No se pudieron abrir los ajustes de alarmas exactas", error)
+                                }
+                                return@Button
+                            }
+                            val scheduledAt = LocalDateTime.of(
+                                LocalDate.parse(eventDateDraft),
+                                LocalTime.of(eventHourDraft, eventMinuteDraft),
+                            ).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                            val name = eventNameDraft.trim().ifBlank { eventAudioTitle }
+                            val scheduled = runCatching {
+                                service?.scheduleRadioEvent(
+                                    name,
+                                    Uri.parse(eventAudioUri),
+                                    eventAudioTitle,
+                                    scheduledAt,
+                                ) == true
+                            }.onFailure { error ->
+                                Log.e(AUDIO_IMPORT_TAG, "No se pudo programar el evento", error)
+                            }.getOrDefault(false)
+                            addMessage = if (scheduled) {
+                                eventNameDraft = ""
+                                eventAudioUri = ""
+                                eventAudioTitle = ""
+                                "Evento programado. Se reproducirá después de la pista actual."
+                            } else {
+                                "No se pudo programar. Comprueba que la fecha y hora sean futuras."
+                            }
+                        },
+                        enabled = eventAudioUri.isNotBlank() && service != null,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("PROGRAMAR EVENTO") }
+
+                    Text("Próximos eventos", style = MaterialTheme.typography.titleMedium)
+                    if (scheduledEvents.isEmpty()) {
+                        Text("Todavía no hay eventos programados.", color = MutedText)
+                    } else {
+                        scheduledEvents.forEach { event ->
+                            Surface(
+                                color = MaterialTheme.colorScheme.surface,
+                                shape = MaterialTheme.shapes.medium,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(event.name, fontWeight = FontWeight.SemiBold)
+                                        Text(event.audioTitle, color = MutedText, style = MaterialTheme.typography.bodySmall)
+                                        Text(
+                                            Instant.ofEpochMilli(event.scheduledAtMillis)
+                                                .atZone(ZoneId.systemDefault())
+                                                .format(DateTimeFormatter.ofPattern("dd/MM/yyyy · HH:mm")),
+                                            color = MaterialTheme.colorScheme.primary,
+                                            style = MaterialTheme.typography.labelMedium,
+                                        )
+                                    }
+                                    TextButton(onClick = { service?.cancelRadioEvent(event.id) }) {
+                                        Text("CANCELAR", color = MaterialTheme.colorScheme.error)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-    }
 
     if (playlistPickerIndex >= 0) {
         AlertDialog(
@@ -1686,6 +2045,48 @@ private fun collectAudioTracks(context: Context, treeUri: Uri): List<Pair<Uri, S
         }
     }
     return audioTracks.sortedBy { (_, title) -> title.lowercase() }
+}
+
+private fun collectClockAudioFiles(context: Context, treeUri: Uri): List<Pair<String, Uri>> {
+    val resolver = context.contentResolver
+    val pendingFolders = ArrayDeque<Pair<String, String>>().apply {
+        addLast(DocumentsContract.getTreeDocumentId(treeUri) to "")
+    }
+    val visitedDocumentIds = mutableSetOf<String>()
+    val audioFiles = mutableListOf<Pair<String, Uri>>()
+    val projection = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+    )
+
+    while (pendingFolders.isNotEmpty()) {
+        val (parentDocumentId, parentPath) = pendingFolders.removeFirst()
+        if (!visitedDocumentIds.add(parentDocumentId)) continue
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+        val cursor = resolver.query(childrenUri, projection, null, null, null)
+            ?: throw IOException("El proveedor de documentos no pudo enumerar la carpeta de locuciones.")
+        cursor.use {
+            val idColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            if (idColumn < 0) throw IOException("El proveedor de documentos no devolvió identificadores.")
+            val nameColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeColumn = it.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (it.moveToNext()) {
+                val documentId = it.getString(idColumn) ?: continue
+                val name = if (nameColumn >= 0) it.getString(nameColumn).orEmpty() else ""
+                val path = listOf(parentPath, name).filter(String::isNotBlank).joinToString("/")
+                val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+                val mimeType = (if (mimeColumn >= 0) it.getString(mimeColumn).orEmpty() else "")
+                    .ifBlank { runCatching { resolver.getType(documentUri) }.getOrNull().orEmpty() }
+                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    pendingFolders.addLast(documentId to path)
+                } else if (mimeType.startsWith("audio/") || isSupportedAudioFile(name)) {
+                    audioFiles += path to documentUri
+                }
+            }
+        }
+    }
+    return audioFiles.sortedBy { (path, _) -> path.lowercase() }
 }
 
 private fun isSupportedAudioFile(name: String): Boolean =

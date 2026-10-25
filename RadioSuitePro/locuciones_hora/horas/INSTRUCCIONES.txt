@@ -1,0 +1,3 @@
+Guarda aquí un audio por cada hora, nombrado del 00 al 23.
+Ejemplos: 00.mp3, 08.wav, 23.ogg.
+Cada archivo debe decir únicamente el número de la hora.

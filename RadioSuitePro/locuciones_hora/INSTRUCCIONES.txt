@@ -1,0 +1,32 @@
+LOCUCIONES PERSONALIZADAS DE HORA
+
+Organiza los audios así:
+
+frase.mp3
+horas/
+  00.mp3
+  01.mp3
+  ...
+  23.mp3
+minutos/
+  00.mp3
+  01.mp3
+  ...
+  59.mp3
+
+El audio "frase.mp3" debe decir: "La hora en Vientosur online".
+Los archivos de "horas" dicen el número de hora (00–23) y los de "minutos"
+el número de minuto (00–59). La aplicación reproduce frase, hora y minutos
+en ese orden, sin insertar una palabra adicional entre los segmentos.
+
+Puedes usar extensiones de audio compatibles con Android, por ejemplo MP3, WAV
+u OGG. Debe haber un solo archivo por segmento. Si falta la frase, al menos un
+audio de hora o al menos un audio de minuto, la carpeta no se activa. Si falta
+cualquier segmento correspondiente a la hora actual, se anuncia la hora completa
+con TTS en lugar de reproducir una locución incompleta.
+
+Para cargar los audios en el teléfono:
+1. Copia la carpeta "locuciones_hora" a "Mis archivos" en el teléfono.
+2. Abre RadioSuite Pro y entra al reproductor.
+3. Abre el menú ⋮ y selecciona "Cargar audios de hora".
+4. Elige la carpeta "locuciones_hora".

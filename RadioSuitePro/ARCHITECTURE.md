@@ -48,6 +48,7 @@ com.radiosuite.pro
 │   └── RadioEngineService.kt   Foreground Service orquestador (reproductor + DSP + stream)
 ├── player
 │   ├── PlaylistManager.kt      Cola, crossfade, mezcla micrófono/música
+│   ├── ClockAnnouncementDataSource.kt  Locución TTS de la hora dentro de la cola
 │   └── AudioSource.kt          Abstracción micrófono / archivo / stream entrante
 ├── stream
 │   ├── IcecastClient.kt        Cliente Icecast v2 (HTTP PUT chunked)
@@ -116,6 +117,21 @@ app/src/main/cpp/
                                 │  Opus/MP3    │
                                 └──────────────┘
 ```
+
+Las locuciones de hora son elementos de cola/playlists. Se puede seleccionar una
+carpeta con `frase.mp3`, `horas/00`–`horas/23` y `minutos/00`–`minutos/59`.
+Cuando se reproduce el elemento, ExoPlayer reproduce la frase, la hora y los
+minutos como segmentos consecutivos. Si falta cualquiera de los segmentos para
+la hora actual, usa TTS para anunciar la hora completa. Los permisos y la
+selección se guardan para los siguientes inicios de la aplicación. Los segmentos
+personalizados también se incorporan a la salida PCM y al stream.
+
+Los eventos de radio son de una sola ejecución y se programan con fecha, hora y
+un archivo de audio local. Android dispara una alarma exacta; el servicio inserta
+el evento después del elemento que esté sonando y conserva el acceso al audio.
+Los eventos pendientes se guardan localmente y se restauran tras reiniciar el
+dispositivo. Si una alarma llega con más de cinco minutos de retraso, se omite.
+La programación requiere habilitar el permiso de alarmas exactas en Android.
 
 El Foreground Service `RadioEngineService` posee y coordina los tres motores
 (reproductor, DSP, streamer) y mantiene vivo el hilo de captura/render de Oboe

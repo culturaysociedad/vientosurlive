@@ -21,15 +21,19 @@ import org.json.JSONObject
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
+import androidx.media3.common.PlaybackException
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.radiosuite.pro.dsp.DspEngine
 import com.radiosuite.pro.dsp.DspParameters
 import com.radiosuite.pro.model.AudioFormat as TrackAudioFormat
 import com.radiosuite.pro.model.Track
 import com.radiosuite.pro.player.EnginePcmProcessor
+import com.radiosuite.pro.player.ClockAnnouncementDataSourceFactory
+import com.radiosuite.pro.player.ClockAnnouncementSynthesizer
 import com.radiosuite.pro.player.PlaylistManager
 import com.radiosuite.pro.stream.IcecastClient
 import com.radiosuite.pro.stream.StreamCodec
@@ -65,6 +69,7 @@ data class PlaybackSnapshot(
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
     val playbackSpeed: Float = 1f,
     val isFavorite: Boolean = false,
+    val errorMessage: String = "",
 )
 
 data class SavedPlaylistTrack(
@@ -72,6 +77,7 @@ data class SavedPlaylistTrack(
     val title: String,
     val isFolder: Boolean = false,
     val folderTrackCount: Int = 0,
+    val isClockAnnouncement: Boolean = false,
 )
 
 data class SavedPlaylistSummary(
@@ -88,6 +94,14 @@ data class SwiperSnapshot(
     val trackCount: Int = 0,
 )
 
+data class ClockAudioFolderSnapshot(
+    val isConfigured: Boolean = false,
+    val folderName: String = "",
+    val hasPhrase: Boolean = false,
+    val configuredHours: List<Int> = emptyList(),
+    val configuredMinutes: List<Int> = emptyList(),
+)
+
 data class MixLevels(
     val playerGainDb: Float = 0f,
     val microphoneGainDb: Float = 0f,
@@ -100,6 +114,7 @@ private data class StoredTrack(val uri: String, val title: String)
 private sealed interface StoredPlaylistEntry {
     data class Track(val uri: String, val title: String) : StoredPlaylistEntry
     data class Folder(val treeUri: String, val name: String, val tracks: List<StoredTrack>) : StoredPlaylistEntry
+    data object ClockAnnouncement : StoredPlaylistEntry
 }
 
 private data class QueueFolderEntry(
@@ -143,6 +158,13 @@ class RadioEngineService : Service() {
     lateinit var playlist: PlaylistManager
         private set
     private lateinit var player: ExoPlayer
+    private lateinit var clockSynthesizer: ClockAnnouncementSynthesizer
+    private var clockAudioFolderName = ""
+    private var clockPhraseAudio: Uri? = null
+    private val clockHourAudioFiles = mutableMapOf<Int, Uri>()
+    private val clockMinuteAudioFiles = mutableMapOf<Int, Uri>()
+    private var playbackErrorMessage = ""
+    private var eventForegroundActive = false
     private val _playback = MutableStateFlow(PlaybackSnapshot())
     val playback: StateFlow<PlaybackSnapshot> = _playback.asStateFlow()
     private val _savedPlaylists = MutableStateFlow<List<SavedPlaylistSummary>>(emptyList())
@@ -151,6 +173,10 @@ class RadioEngineService : Service() {
     val favoriteTracks: StateFlow<List<FavoriteTrack>> = _favoriteTracks.asStateFlow()
     private val _swiperStatus = MutableStateFlow(SwiperSnapshot())
     val swiperStatus: StateFlow<SwiperSnapshot> = _swiperStatus.asStateFlow()
+    private val _clockAudioFolderStatus = MutableStateFlow(ClockAudioFolderSnapshot())
+    val clockAudioFolderStatus: StateFlow<ClockAudioFolderSnapshot> = _clockAudioFolderStatus.asStateFlow()
+    private val _scheduledEvents = MutableStateFlow<List<ScheduledRadioEvent>>(emptyList())
+    val scheduledEvents: StateFlow<List<ScheduledRadioEvent>> = _scheduledEvents.asStateFlow()
     private val _mixLevels = MutableStateFlow(MixLevels())
     val mixLevels: StateFlow<MixLevels> = _mixLevels.asStateFlow()
     private val storedPlaylists = linkedMapOf<String, List<StoredPlaylistEntry>>()
@@ -208,11 +234,42 @@ class RadioEngineService : Service() {
                 .setAudioProcessors(arrayOf(EnginePcmProcessor(engine)))
                 .build()
         }
-        player = ExoPlayer.Builder(this, renderersFactory).build().apply {
+        clockSynthesizer = ClockAnnouncementSynthesizer(this)
+        restoreClockAudioFolder()
+        _scheduledEvents.value = RadioEventScheduler.load(this)
+        RadioEventScheduler.restore(this)
+        val mediaSourceFactory = DefaultMediaSourceFactory(this)
+            .setDataSourceFactory(ClockAnnouncementDataSourceFactory(this, clockSynthesizer))
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build().apply {
             addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) = publishPlayback()
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                    rotateFolderEntryOnTransition(mediaItem?.mediaId, reason)
+                    val mediaId = mediaItem?.mediaId.orEmpty()
+                    if (mediaId.startsWith(RADIO_EVENT_MEDIA_ID_PREFIX)) {
+                        playbackErrorMessage = ""
+                        publishPlayback()
+                        return
+                    }
+                    if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT &&
+                        player.repeatMode == Player.REPEAT_MODE_ONE &&
+                        mediaId.startsWith(CLOCK_SEGMENT_MEDIA_ID_PREFIX) &&
+                        mediaId.endsWith(":minute")
+                    ) {
+                        val index = player.currentMediaItemIndex
+                        if (index >= 2) player.seekTo(index - 2, 0L)
+                        return
+                    }
+                    if (mediaItem != null && expandClockAnnouncement(mediaItem)) return
+                    playbackErrorMessage = ""
+                    rotateFolderEntryOnTransition(mediaId, reason)
+                    publishPlayback()
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    playbackErrorMessage = error.message ?: "No se pudo reproducir este elemento."
+                    Log.e(TAG, "Error de reproducción", error)
                     publishPlayback()
                 }
 
@@ -222,6 +279,11 @@ class RadioEngineService : Service() {
                             refreshFolderEntry(folderId)
                             player.prepare()
                             player.play()
+                        }
+                        if (eventForegroundActive && !isStreaming) {
+                            eventForegroundActive = false
+                            stopForegroundCompat()
+                            stopSelf()
                         }
                     }
                     publishPlayback()
@@ -262,6 +324,22 @@ class RadioEngineService : Service() {
         }
     }
 
+    fun enqueueClockAnnouncement(): Boolean {
+        if (!::player.isInitialized) return false
+        return try {
+            playbackErrorMessage = ""
+            player.addMediaItem(createClockAnnouncementMediaItem())
+            syncPlaylist()
+            if (player.playbackState == Player.STATE_IDLE) player.prepare()
+            player.play()
+            publishPlayback()
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "No se pudo añadir la locución de hora a la cola", error)
+            false
+        }
+    }
+
     fun enqueueRandomFolder(treeUri: Uri, folderName: String, tracks: List<Pair<Uri, String>>): Boolean {
         if (tracks.isEmpty() || !::player.isInitialized) return false
         val entry = QueueFolderEntry(
@@ -296,6 +374,119 @@ class RadioEngineService : Service() {
         musicEntriesSinceSwiper = 0
         persistSwiperFolder()
         publishSwiperStatus()
+    }
+
+    fun configureClockAudioFolder(
+        folderName: String,
+        phraseAudio: Uri?,
+        hourAudioFiles: Map<Int, Uri>,
+        minuteAudioFiles: Map<Int, Uri>,
+    ): Boolean {
+        if (phraseAudio == null || hourAudioFiles.isEmpty() || minuteAudioFiles.isEmpty() ||
+            hourAudioFiles.keys.any { it !in 0..23 } ||
+            minuteAudioFiles.keys.any { it !in 0..59 }
+        ) return false
+        clockAudioFolderName = folderName
+        clockPhraseAudio = phraseAudio
+        clockHourAudioFiles.clear()
+        clockHourAudioFiles.putAll(hourAudioFiles)
+        clockMinuteAudioFiles.clear()
+        clockMinuteAudioFiles.putAll(minuteAudioFiles)
+        persistClockAudioFolder()
+        publishClockAudioFolderStatus()
+        return true
+    }
+
+    fun clearClockAudioFolder() {
+        clockAudioFolderName = ""
+        clockPhraseAudio = null
+        clockHourAudioFiles.clear()
+        clockMinuteAudioFiles.clear()
+        getSharedPreferences(CLOCK_AUDIO_PREFS, Context.MODE_PRIVATE)
+            .edit().remove(CLOCK_AUDIO_JSON).apply()
+        publishClockAudioFolderStatus()
+    }
+
+    fun scheduleRadioEvent(
+        name: String,
+        audioUri: Uri,
+        audioTitle: String,
+        scheduledAtMillis: Long,
+    ): Boolean {
+        if (name.isBlank() || audioTitle.isBlank() || scheduledAtMillis <= System.currentTimeMillis()) return false
+        return try {
+            val event = RadioEventScheduler.newEvent(name.trim(), audioUri.toString(), audioTitle, scheduledAtMillis)
+            RadioEventScheduler.schedule(this, event)
+            val events = RadioEventScheduler.load(this) + event
+            RadioEventScheduler.save(this, events.sortedBy(ScheduledRadioEvent::scheduledAtMillis))
+            publishScheduledEvents()
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "No se pudo programar el evento", error)
+            false
+        }
+    }
+
+    fun cancelRadioEvent(eventId: String) {
+        RadioEventScheduler.cancel(this, eventId)
+        RadioEventScheduler.save(
+            this,
+            RadioEventScheduler.load(this).filterNot { it.id == eventId },
+        )
+        publishScheduledEvents()
+    }
+
+    private fun playScheduledEvent(eventId: String) {
+        val event = RadioEventScheduler.eventFor(this, eventId) ?: run {
+            if (!isStreaming) {
+                stopForegroundCompat()
+                stopSelf()
+            }
+            return
+        }
+        if (System.currentTimeMillis() - event.scheduledAtMillis > EVENT_MISSED_TOLERANCE_MS) {
+            cancelRadioEvent(eventId)
+            Log.w(TAG, "Se omitió el evento vencido ${event.name}")
+            if (!isStreaming) {
+                stopForegroundCompat()
+                stopSelf()
+            }
+            return
+        }
+        cancelRadioEvent(eventId)
+        eventForegroundActive = true
+        val mediaItem = MediaItem.Builder()
+            .setMediaId("$RADIO_EVENT_MEDIA_ID_PREFIX${event.id}")
+            .setUri(Uri.parse(event.audioUri))
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(event.name)
+                    .setArtist("Evento programado · ${event.audioTitle}")
+                    .build(),
+            )
+            .build()
+        val currentIndex = player.currentMediaItemIndex
+        if (currentIndex in 0 until player.mediaItemCount) {
+            var insertionIndex = currentIndex + 1
+            while (insertionIndex < player.mediaItemCount &&
+                player.getMediaItemAt(insertionIndex).mediaId.startsWith(RADIO_EVENT_MEDIA_ID_PREFIX)
+            ) insertionIndex++
+            player.addMediaItem(insertionIndex, mediaItem)
+            if (player.playbackState == Player.STATE_ENDED) {
+                player.seekToDefaultPosition(insertionIndex)
+                player.prepare()
+                player.play()
+            }
+        } else {
+            player.addMediaItem(mediaItem)
+            if (player.playbackState == Player.STATE_IDLE) player.prepare()
+            player.play()
+        }
+        publishPlayback()
+    }
+
+    private fun publishScheduledEvents() {
+        _scheduledEvents.value = RadioEventScheduler.load(this)
     }
 
     fun togglePlayback() {
@@ -400,6 +591,7 @@ class RadioEngineService : Service() {
 
     fun toggleFavoriteCurrentTrack() {
         val item = player.currentMediaItem ?: return
+        if (item.mediaId.startsWith(CLOCK_MEDIA_ID_PREFIX)) return
         val uri = item.localConfiguration?.uri?.toString() ?: return
         if (storedFavorites.remove(uri) == null) {
             val title = item.mediaMetadata.title?.toString() ?: uri.substringAfterLast('/')
@@ -449,6 +641,11 @@ class RadioEngineService : Service() {
     }
 
     private fun storedEntryFor(item: MediaItem): StoredPlaylistEntry? {
+        if (item.mediaId.startsWith(CLOCK_MEDIA_ID_PREFIX) ||
+            item.mediaId.startsWith(CLOCK_SEGMENT_MEDIA_ID_PREFIX)
+        ) {
+            return StoredPlaylistEntry.ClockAnnouncement
+        }
         queueFolders[item.mediaId]?.let { folder ->
             return StoredPlaylistEntry.Folder(folder.treeUri, folder.name, folder.tracks)
         }
@@ -497,6 +694,14 @@ class RadioEngineService : Service() {
         return tracks.size
     }
 
+    fun addClockAnnouncementToPlaylist(playlistName: String): Boolean {
+        val entries = storedPlaylists[playlistName] ?: return false
+        storedPlaylists[playlistName] = entries + StoredPlaylistEntry.ClockAnnouncement
+        persistPlaylists()
+        publishSavedPlaylists()
+        return true
+    }
+
     fun addFolderToPlaylist(
         playlistName: String,
         treeUri: Uri,
@@ -526,13 +731,27 @@ class RadioEngineService : Service() {
             storedPlaylists.keys.any { it.equals(normalizedName, ignoreCase = true) }
         ) return false
 
-        val entries = (0 until player.mediaItemCount).mapNotNull { index ->
-            storedEntryFor(player.getMediaItemAt(index))
-        }
+        val entries = storedEntriesForQueue()
         storedPlaylists[normalizedName] = entries
         persistPlaylists()
         publishSavedPlaylists()
         return true
+    }
+
+    private fun storedEntriesForQueue(): List<StoredPlaylistEntry> {
+        val entries = mutableListOf<StoredPlaylistEntry>()
+        val handledClockGroups = mutableSetOf<String>()
+        for (index in 0 until player.mediaItemCount) {
+            val item = player.getMediaItemAt(index)
+            val mediaId = item.mediaId
+            if (mediaId.startsWith(CLOCK_SEGMENT_MEDIA_ID_PREFIX)) {
+                val groupId = mediaId.removePrefix(CLOCK_SEGMENT_MEDIA_ID_PREFIX).substringBefore(':')
+                if (handledClockGroups.add(groupId)) entries += StoredPlaylistEntry.ClockAnnouncement
+            } else {
+                storedEntryFor(item)?.let(entries::add)
+            }
+        }
+        return entries
     }
 
     fun renamePlaylist(name: String, newName: String): Boolean {
@@ -634,6 +853,7 @@ class RadioEngineService : Service() {
             repeatMode = player.repeatMode,
             playbackSpeed = player.playbackParameters.speed,
             isFavorite = item?.localConfiguration?.uri?.toString()?.let(storedFavorites::containsKey) == true,
+            errorMessage = playbackErrorMessage,
         )
     }
 
@@ -642,6 +862,37 @@ class RadioEngineService : Service() {
         .setMediaMetadata(MediaMetadata.Builder().setTitle(title).build())
         .build()
 
+    private fun createClockAnnouncementMediaItem(): MediaItem = MediaItem.Builder()
+        .setMediaId("$CLOCK_MEDIA_ID_PREFIX${UUID.randomUUID()}")
+        .setUri(Uri.parse("$CLOCK_MEDIA_URI_PREFIX/announcement"))
+        .setMediaMetadata(MediaMetadata.Builder().setTitle(CLOCK_ANNOUNCEMENT_TITLE).build())
+        .build()
+
+    private fun expandClockAnnouncement(item: MediaItem): Boolean {
+        if (!item.mediaId.startsWith(CLOCK_MEDIA_ID_PREFIX)) return false
+        val index = player.currentMediaItemIndex
+        val phraseUri = clockPhraseAudio ?: return false
+        val now = java.time.LocalTime.now()
+        val hourUri = clockHourAudioFiles[now.hour] ?: return false
+        val minuteUri = clockMinuteAudioFiles[now.minute] ?: return false
+        if (index !in 0 until player.mediaItemCount) return false
+
+        val groupId = item.mediaId.removePrefix(CLOCK_MEDIA_ID_PREFIX)
+        val segments = listOf(
+            Triple("phrase", phraseUri, "$CLOCK_ANNOUNCEMENT_TITLE · frase"),
+            Triple("hour", hourUri, "$CLOCK_ANNOUNCEMENT_TITLE · hora"),
+            Triple("minute", minuteUri, "$CLOCK_ANNOUNCEMENT_TITLE · minutos"),
+        ).map { (segment, uri, title) ->
+            MediaItem.Builder()
+                .setMediaId("$CLOCK_SEGMENT_MEDIA_ID_PREFIX$groupId:$segment")
+                .setUri(uri)
+                .setMediaMetadata(MediaMetadata.Builder().setTitle(title).build())
+                .build()
+        }
+        player.replaceMediaItems(index, index + 1, segments)
+        return true
+    }
+
     private fun createMediaItemsForEntries(entries: List<StoredPlaylistEntry>): List<MediaItem> =
         entries.mapNotNull { entry ->
             when (entry) {
@@ -649,6 +900,7 @@ class RadioEngineService : Service() {
                 is StoredPlaylistEntry.Folder -> createFolderMediaItem(
                     QueueFolderEntry(entry.treeUri, entry.name, entry.tracks),
                 )
+                StoredPlaylistEntry.ClockAnnouncement -> createClockAnnouncementMediaItem()
             }
         }
 
@@ -668,6 +920,12 @@ class RadioEngineService : Service() {
 
     private fun queueEntryTitle(item: MediaItem): String = queueFolders[item.mediaId]?.let { "Carpeta · ${it.name}" }
         ?: swiperQueueEntries[item.mediaId]?.let { "Swiper · $it" }
+        ?: when {
+            item.mediaId.startsWith(CLOCK_SEGMENT_MEDIA_ID_PREFIX) ->
+                item.mediaMetadata.title?.toString() ?: CLOCK_ANNOUNCEMENT_TITLE
+            item.mediaId.startsWith(CLOCK_MEDIA_ID_PREFIX) -> CLOCK_ANNOUNCEMENT_TITLE
+            else -> null
+        }
         ?: item.mediaMetadata.title?.toString()
         ?: item.localConfiguration?.uri?.lastPathSegment.orEmpty()
 
@@ -683,7 +941,11 @@ class RadioEngineService : Service() {
         val previousId = lastQueueMediaId
         val naturalTransition = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
             reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
-        if (naturalTransition && previousId != null && !previousId.startsWith(SWIPER_MEDIA_ID_PREFIX)) {
+        if (naturalTransition && previousId != null &&
+            !previousId.startsWith(SWIPER_MEDIA_ID_PREFIX) &&
+            !previousId.startsWith(CLOCK_MEDIA_ID_PREFIX) &&
+            !previousId.startsWith(CLOCK_SEGMENT_MEDIA_ID_PREFIX)
+        ) {
             musicEntriesSinceSwiper++
         }
         if (previousId != null && queueFolders.containsKey(previousId) &&
@@ -790,6 +1052,68 @@ class RadioEngineService : Service() {
         )
     }
 
+    private fun restoreClockAudioFolder() {
+        val saved = getSharedPreferences(CLOCK_AUDIO_PREFS, Context.MODE_PRIVATE)
+            .getString(CLOCK_AUDIO_JSON, null) ?: return publishClockAudioFolderStatus()
+        try {
+            val json = JSONObject(saved)
+            clockPhraseAudio = Uri.parse(json.getString("phrase"))
+            val hours = json.getJSONArray("hours")
+            val minutes = json.getJSONArray("minutes")
+            for (index in 0 until hours.length()) {
+                val entry = hours.getJSONObject(index)
+                clockHourAudioFiles[entry.getInt("value")] = Uri.parse(entry.getString("uri"))
+            }
+            for (index in 0 until minutes.length()) {
+                val entry = minutes.getJSONObject(index)
+                clockMinuteAudioFiles[entry.getInt("value")] = Uri.parse(entry.getString("uri"))
+            }
+            clockAudioFolderName = json.getString("name")
+            if (clockPhraseAudio == null || clockHourAudioFiles.isEmpty() || clockMinuteAudioFiles.isEmpty()) {
+                throw IllegalArgumentException("La carpeta guardada no contiene los segmentos requeridos")
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "No se pudo restaurar la carpeta de segmentos de locución; se usará TTS", error)
+            clockAudioFolderName = ""
+            clockPhraseAudio = null
+            clockHourAudioFiles.clear()
+            clockMinuteAudioFiles.clear()
+            getSharedPreferences(CLOCK_AUDIO_PREFS, Context.MODE_PRIVATE)
+                .edit().remove(CLOCK_AUDIO_JSON).apply()
+        }
+        publishClockAudioFolderStatus()
+    }
+
+    private fun persistClockAudioFolder() {
+        val hours = JSONArray()
+        clockHourAudioFiles.toSortedMap().forEach { (value, uri) ->
+            hours.put(JSONObject().put("value", value).put("uri", uri.toString()))
+        }
+        val minutes = JSONArray()
+        clockMinuteAudioFiles.toSortedMap().forEach { (value, uri) ->
+            minutes.put(JSONObject().put("value", value).put("uri", uri.toString()))
+        }
+        val saved = JSONObject()
+            .put("name", clockAudioFolderName)
+            .put("phrase", clockPhraseAudio.toString())
+            .put("hours", hours)
+            .put("minutes", minutes)
+        getSharedPreferences(CLOCK_AUDIO_PREFS, Context.MODE_PRIVATE)
+            .edit().putString(CLOCK_AUDIO_JSON, saved.toString()).apply()
+    }
+
+    private fun publishClockAudioFolderStatus() {
+        _clockAudioFolderStatus.value = ClockAudioFolderSnapshot(
+            isConfigured = clockPhraseAudio != null &&
+                clockHourAudioFiles.isNotEmpty() &&
+                clockMinuteAudioFiles.isNotEmpty(),
+            folderName = clockAudioFolderName,
+            hasPhrase = clockPhraseAudio != null,
+            configuredHours = clockHourAudioFiles.keys.sorted(),
+            configuredMinutes = clockMinuteAudioFiles.keys.sorted(),
+        )
+    }
+
     fun removeSwiperItemsFromQueue() {
         val swiperIds = swiperQueueEntries.keys.toSet()
         for (index in player.mediaItemCount - 1 downTo 0) {
@@ -820,19 +1144,21 @@ class RadioEngineService : Service() {
                 val tracksJson = playlistObject.getJSONArray("tracks")
                 val tracks = (0 until tracksJson.length()).map { trackIndex ->
                     val track = tracksJson.getJSONObject(trackIndex)
-                    if (track.optString("type", "track") == "folder") {
-                        val folderTracksJson = track.optJSONArray("tracks") ?: JSONArray()
-                        val folderTracks = (0 until folderTracksJson.length()).map { folderTrackIndex ->
-                            val folderTrack = folderTracksJson.getJSONObject(folderTrackIndex)
-                            StoredTrack(folderTrack.getString("uri"), folderTrack.getString("title"))
+                    when (track.optString("type", "track")) {
+                        "folder" -> {
+                            val folderTracksJson = track.optJSONArray("tracks") ?: JSONArray()
+                            val folderTracks = (0 until folderTracksJson.length()).map { folderTrackIndex ->
+                                val folderTrack = folderTracksJson.getJSONObject(folderTrackIndex)
+                                StoredTrack(folderTrack.getString("uri"), folderTrack.getString("title"))
+                            }
+                            StoredPlaylistEntry.Folder(
+                                treeUri = track.getString("uri"),
+                                name = track.getString("name"),
+                                tracks = folderTracks,
+                            )
                         }
-                        StoredPlaylistEntry.Folder(
-                            treeUri = track.getString("uri"),
-                            name = track.getString("name"),
-                            tracks = folderTracks,
-                        )
-                    } else {
-                        StoredPlaylistEntry.Track(track.getString("uri"), track.getString("title"))
+                        "clock" -> StoredPlaylistEntry.ClockAnnouncement
+                        else -> StoredPlaylistEntry.Track(track.getString("uri"), track.getString("title"))
                     }
                 }
                 storedPlaylists[playlistObject.getString("name")] = tracks
@@ -870,6 +1196,9 @@ class RadioEngineService : Service() {
                                 .put("tracks", folderTracks),
                         )
                     }
+                    StoredPlaylistEntry.ClockAnnouncement -> {
+                        trackArray.put(JSONObject().put("type", "clock"))
+                    }
                 }
             }
             array.put(JSONObject().put("name", name).put("tracks", trackArray))
@@ -888,6 +1217,11 @@ class RadioEngineService : Service() {
                         title = entry.name,
                         isFolder = true,
                         folderTrackCount = entry.tracks.size,
+                    )
+                    StoredPlaylistEntry.ClockAnnouncement -> SavedPlaylistTrack(
+                        uri = "",
+                        title = CLOCK_ANNOUNCEMENT_TITLE,
+                        isClockAnnouncement = true,
                     )
                 }
             }
@@ -935,6 +1269,10 @@ class RadioEngineService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_PLAY_SCHEDULED_EVENT -> {
+                if (!isStreaming) startForegroundCompat(includeMicrophone = false)
+                playScheduledEvent(intent.getStringExtra(EXTRA_EVENT_ID).orEmpty())
+            }
             ACTION_START_STREAM -> startBroadcast(
                 host = intent.getStringExtra(EXTRA_HOST).orEmpty(),
                 port = intent.getIntExtra(EXTRA_PORT, 8000),
@@ -1030,10 +1368,20 @@ class RadioEngineService : Service() {
         listenerCountJob?.cancel()
         listenerCountJob = null
         _streamStatus.value = StreamSnapshot()
-        stopForegroundCompat()
-        stopSelf()
+        if (hasPendingRadioEvent()) {
+            startForegroundCompat(includeMicrophone = false)
+            eventForegroundActive = true
+        } else {
+            stopForegroundCompat()
+            stopSelf()
+        }
         Log.i(TAG, "Streaming detenido")
     }
+
+    private fun hasPendingRadioEvent(): Boolean =
+        (0 until player.mediaItemCount).any {
+            player.getMediaItemAt(it).mediaId.startsWith(RADIO_EVENT_MEDIA_ID_PREFIX)
+        }
 
     private fun publishStreamStatus(host: String, port: Int, mount: String) {
         _streamStatus.value = StreamSnapshot(
@@ -1263,6 +1611,7 @@ class RadioEngineService : Service() {
         engine.stop()
         engine.release()
         player.release()
+        if (::clockSynthesizer.isInitialized) clockSynthesizer.shutdown()
         scope.cancel()
         Log.i(TAG, "Servicio destruido y motores liberados")
         super.onDestroy()
@@ -1287,7 +1636,15 @@ class RadioEngineService : Service() {
         private const val FAVORITES_JSON = "favorite_tracks"
         private const val SWIPER_PREFS = "radio_swiper"
         private const val SWIPER_JSON = "swiper_source"
+        private const val CLOCK_AUDIO_PREFS = "radio_clock_audio"
+        private const val CLOCK_AUDIO_JSON = "clock_audio_folder"
         private const val SWIPER_MEDIA_ID_PREFIX = "swiper:"
+        private const val CLOCK_MEDIA_ID_PREFIX = "clock:"
+        private const val CLOCK_SEGMENT_MEDIA_ID_PREFIX = "clock-segment:"
+        private const val CLOCK_MEDIA_URI_PREFIX = "radiosuite-clock://"
+        private const val CLOCK_ANNOUNCEMENT_TITLE = "Locución de hora"
+        private const val RADIO_EVENT_MEDIA_ID_PREFIX = "radio-event:"
+        private const val EVENT_MISSED_TOLERANCE_MS = 5 * 60 * 1000L
         private const val SWIPER_INTERVAL_TRACKS = 2
         private const val MIX_PREFS = "radio_mix"
         private const val PLAYER_GAIN_KEY = "player_gain_db"
@@ -1299,7 +1656,9 @@ class RadioEngineService : Service() {
         const val ACTION_START_STREAM = "com.radiosuite.pro.START_STREAM"
         const val ACTION_STOP_STREAM  = "com.radiosuite.pro.STOP_STREAM"
         const val ACTION_UPDATE_DSP   = "com.radiosuite.pro.UPDATE_DSP"
+        const val ACTION_PLAY_SCHEDULED_EVENT = "com.radiosuite.pro.PLAY_SCHEDULED_EVENT"
 
+        const val EXTRA_EVENT_ID = "eventId"
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
         const val EXTRA_MOUNT = "mount"
